@@ -48,20 +48,16 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         """Process a single example into input_ids, labels, boundaries, and margin."""
         context, chosen, rejected = ex['inputs_context'], ex['inputs_chosen'], ex['inputs_rejected']
 
-        # Sequential arrangement: [context | chosen | rejected]
-        input_ids = torch.cat([context, chosen, rejected])
-
-        # Labels: mask context with -100
-        labels = input_ids.clone()
-        labels[:len(context)] = DISABLE_LOSS_LABEL
+        chosen_input_ids = torch.cat([context, chosen])
+        rejected_input_ids = torch.cat([context, rejected])
 
         boundaries = {
             'context_end': len(context),
             'chosen_end': len(context) + len(chosen),
-            'rejected_end': len(context) + len(chosen) + len(rejected)
+            'rejected_end': len(context)  + len(rejected)
         }
 
-        return input_ids, labels, boundaries, ex.get('precomputed_margin')
+        return chosen_input_ids, rejected_input_ids, boundaries, ex.get('precomputed_margin')
 
     def _get_attn_mask(self, boundaries_tensor: torch.Tensor, max_seq_len: int, device: torch.device) -> torch.Tensor:
         """
@@ -191,21 +187,43 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
             2. Use parent DataCollatorForSeq2Seq to pad all features to uniform length
             3. Add metadata (chosen_idxs, precomputed_margin) for trainer to split and process
         """
-        chosen, rejected = [], []
-        precomputed_margins = []
+        processed = [self._process_example(ex) for ex in examples]
+        chosen, rejected, boundaries_list, margins = zip(*processed)
 
-        for ex in examples:
-            chosen.append({'input_ids': torch.cat([ex['inputs_context'], ex['inputs_chosen']])})
-            rejected.append({'input_ids': torch.cat([ex['inputs_context'], ex['inputs_rejected']])})
-            # all_features.append(ex['input_ids'])
-            if 'precomputed_margin' in ex and ex['precomputed_margin'] is not None:
-                precomputed_margins.append(ex['precomputed_margin'])
-
-        # Use parent class to handle padding - it will pad all features to max length
-        batch = super().__call__(chosen + rejected)
+        # Use parent class for padding
+        batch = super().__call__(
+            [{'input_ids': input_ids}
+             for input_ids in  list(chosen) + list(rejected)]
+        )
         batch['chosen_idxs'] = len(chosen)
 
-        if precomputed_margins:
-            batch['precomputed_margin'] = torch.tensor(precomputed_margins)
+        device = batch['input_ids'].device
+
+        # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
+        non_pad_mask = (batch['input_ids'] != self.tokenizer.pad_token_id)
+        token_indices = torch.arange(batch['input_ids'].shape[-1], dtype=torch.int32)
+        last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+
+        # print('last_non_pad_token', int(last_non_pad_token[0]),
+        #       [self.tokenizer.decode([batch['input_ids'][0, last_non_pad_token[0]]]), ])
+        # test_inputs = batch['input_ids'][0, last_non_pad_token[0] - 4:last_non_pad_token[0] + 3]
+        # print([self.tokenizer.decode([int(t), ]) for t in test_inputs])
+
+        boundaries_tensor = torch.tensor(
+            [[b['context_end'], b['chosen_end'], b['rejected_end']] for b in boundaries_list],
+            dtype=torch.long,
+            device=device
+        )
+
+        # Get actual padded length
+        batch_size, max_seq_len = batch['input_ids'].shape[:2]
+        # batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)
+        # batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
+        batch['chosen_indices'], batch['rejected_indices'] = self._get_reward_indices(boundaries_tensor, max_seq_len)
+
+        assert torch.all(last_non_pad_token[:len(chosen)] == batch['chosen_indices'])
+        assert torch.all(last_non_pad_token[len(chosen):] == batch['rejected_indices'])
+
+        # print('batch_size', batch_size, 'chosen_idxs', batch['chosen_idxs'])
 
         return batch

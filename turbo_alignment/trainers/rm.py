@@ -5,7 +5,6 @@ from typing import Any
 import torch
 from peft import PeftModel
 from torch import nn
-from transformers import Qwen2ForSequenceClassification
 from transformers.modeling_utils import PreTrainedModel
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_pt_utils import nested_detach
@@ -60,27 +59,25 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             loss = -log(sigmoid(rewards_w - rewards_l)).mean()
             Encourages chosen rewards > rejected rewards
         """
-        input_ids = inputs['input_ids'].to(self.accelerator.device)
-        attention_mask = inputs['attention_mask'].to(self.accelerator.device)
+        device = self.accelerator.device
+        input_ids = inputs['input_ids'].to(device)
+        attention_mask = inputs['attention_mask'].to(device)
 
         hidden_states = model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             use_cache=False,
         ).last_hidden_state
-        logits = model.score(hidden_states).squeeze(-1)  # [batch_size, seq_len]
+        logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
 
         batch_size = input_ids.shape[0]
+        # Extract rewards using pre-computed indices
+        chosen_indices = inputs['chosen_indices'].to(device)
+        rejected_indices = inputs['rejected_indices'].to(device)
 
-        # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-        non_pad_mask = (input_ids != self.model.config.pad_token_id).to(logits.device, torch.int32)
-        token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
-        last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
-
-        all_rewards = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token].unsqueeze(-1)
-        # Split rewards at chosen_idxs: first half is chosen, second half is rejected
         chosen_idxs = inputs['chosen_idxs']
-        rewards_w, rewards_l = all_rewards[:chosen_idxs], all_rewards[chosen_idxs:]
+        rewards_w = logits[torch.arange(chosen_idxs, device=logits.device), chosen_indices]
+        rewards_l = logits[torch.arange(chosen_idxs, batch_size, device=logits.device), rejected_indices]
 
         # Compute ranking loss: chosen should have higher reward than rejected
         loss = -torch.nn.functional.logsigmoid(rewards_w - rewards_l).mean()
