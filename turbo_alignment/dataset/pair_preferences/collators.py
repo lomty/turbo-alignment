@@ -77,7 +77,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
             2. Use parent DataCollatorForSeq2Seq to pad all features to uniform length
             3. Add metadata (chosen_idxs, precomputed_margin) for trainer to split and process
         """
-        chosen, rejected  = [], []
+        chosen, rejected = [], []
         precomputed_margins = []
 
         for ex in examples:
@@ -88,15 +88,8 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
                 precomputed_margins.append(ex['precomputed_margin'])
 
         # Use parent class to handle padding - it will pad all features to max length
-        batch = super().__call__(chosen+rejected)
+        batch = super().__call__(chosen + rejected)
         batch['chosen_idxs'] = len(chosen)
-
-        #TODO:remove
-        batch['inputs_w'], batch['inputs_l'] = dict(), dict()
-        for name, key in batch.items():
-            if hasattr(batch[name], 'shape'):
-                batch['inputs_w'][name] = batch[name][:len(chosen)]
-                batch['inputs_l'][name] = batch[name][len(chosen):]
 
         if precomputed_margins:
             batch['precomputed_margin'] = torch.tensor(precomputed_margins)

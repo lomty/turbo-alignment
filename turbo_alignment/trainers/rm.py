@@ -12,58 +12,64 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
-from turbo_alignment.trainers.utils import concatenated_inputs
-from turbo_alignment.sequence_parallel.collator import pad_for_sequence_parallel
-from turbo_alignment.modeling import parallel_states
 
 logger = logging.get_logger(__name__)
 
 
 class RMTrainer(MultiGPUCherryPicksTrainer):
-    def concatenated_forward(self, model: nn.Module, batch: dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
-        concatenated_batch = concatenated_inputs(batch, device=self.accelerator.device)
+    """
+    Reward Model Trainer for preference learning.
 
-        input_ids = concatenated_batch['input_ids']
-        attention_mask = concatenated_batch['attention_mask']
+    Trains a reward model by comparing scores for chosen vs rejected responses.
+    Expects batches from PairPreferenceDataCollator with structure:
+        {
+            'input_ids': Tensor[2*batch_size, seq_len],  # chosen first, then rejected
+            'attention_mask': Tensor[2*batch_size, seq_len],
+            'labels': Tensor[2*batch_size, seq_len],
+            'chosen_idxs': int,  # batch_size, used to split chosen/rejected
+            'precomputed_margin': Optional[Tensor[batch_size]]
+        }
 
-        if parallel_states.sequence_parallel_is_initialized():
-            input_ids = pad_for_sequence_parallel(
-                input_ids,
-                parallel_states.get_sequence_parallel_world_size(),
-                self.tokenizer.pad_token_id,  # type: ignore[union-attr]
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-            attention_mask = pad_for_sequence_parallel(
-                attention_mask,
-                parallel_states.get_sequence_parallel_world_size(),
-                0,
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-
-            chunk_size = input_ids.size(-1) // parallel_states.get_sequence_parallel_world_size()
-            start = chunk_size * parallel_states.get_sequence_parallel_rank()
-            end = chunk_size * (parallel_states.get_sequence_parallel_rank() + 1)
-            input_ids = input_ids[:, start:end].clone()
-
-        all_rewards = model(input_ids, attention_mask=attention_mask, return_dict=True)[0]
-
-        chosen_idxs = batch['inputs_w']['input_ids'].shape[0]
-
-        chosen_rewards = all_rewards[:chosen_idxs]
-        rejected_rewards = all_rewards[chosen_idxs:]
-
-        return chosen_rewards, rejected_rewards
+    The collator concatenates chosen and rejected inputs along batch dimension for efficient
+    forward pass. The trainer splits rewards at chosen_idxs for loss computation.
+    """
 
     def compute_loss(
-        self,
-        model,
-        inputs,
-        return_outputs=False,
-        num_items_in_batch=None,  # pylint: disable=unused-argument
+            self,
+            model,
+            inputs,
+            return_outputs=False,
+            num_items_in_batch=None,  # pylint: disable=unused-argument
     ) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
-        rewards_w, rewards_l = self.concatenated_forward(model, inputs)
+        """
+        Compute ranking loss for reward model.
 
+        Args:
+            model: Reward model
+            inputs: Batch dictionary with concatenated chosen/rejected inputs
+            return_outputs: If True, return (loss, outputs_dict)
+            num_items_in_batch: Unused, kept for API compatibility
+
+        Returns:
+            If return_outputs=False: loss scalar
+            If return_outputs=True: (loss, {'rewards_w': Tensor[batch_size],
+                                            'rewards_l': Tensor[batch_size]})
+
+        Loss computation:
+            loss = -log(sigmoid(rewards_w - rewards_l)).mean()
+            Encourages chosen rewards > rejected rewards
+        """
+        input_ids = inputs['input_ids'].to(self.accelerator.device)
+        attention_mask = inputs['attention_mask'].to(self.accelerator.device)
+
+        all_rewards = model(input_ids, attention_mask=attention_mask, return_dict=True)[0]
+        # Split rewards at chosen_idxs: first half is chosen, second half is rejected
+        chosen_idxs = inputs['chosen_idxs']
+        rewards_w, rewards_l = all_rewards[:chosen_idxs], all_rewards[chosen_idxs:]
+
+        # Compute ranking loss: chosen should have higher reward than rejected
         loss = -torch.nn.functional.logsigmoid(rewards_w - rewards_l).mean()
+
         if return_outputs:
             return loss, {'rewards_w': rewards_w, 'rewards_l': rewards_l}
         return loss
