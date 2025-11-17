@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from peft import PeftModel
 from torch import nn
+from transformers import Qwen2ForSequenceClassification
 from transformers.modeling_utils import PreTrainedModel
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_pt_utils import nested_detach
@@ -62,7 +63,21 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         input_ids = inputs['input_ids'].to(self.accelerator.device)
         attention_mask = inputs['attention_mask'].to(self.accelerator.device)
 
-        all_rewards = model(input_ids, attention_mask=attention_mask, return_dict=True)[0]
+        hidden_states = model.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        ).last_hidden_state
+        logits = model.score(hidden_states).squeeze(-1)  # [batch_size, seq_len]
+
+        batch_size = input_ids.shape[0]
+
+        # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
+        non_pad_mask = (input_ids != self.model.config.pad_token_id).to(logits.device, torch.int32)
+        token_indices = torch.arange(input_ids.shape[-1], device=logits.device, dtype=torch.int32)
+        last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+
+        all_rewards = logits[torch.arange(batch_size, device=logits.device), last_non_pad_token].unsqueeze(-1)
         # Split rewards at chosen_idxs: first half is chosen, second half is rejected
         chosen_idxs = inputs['chosen_idxs']
         rewards_w, rewards_l = all_rewards[:chosen_idxs], all_rewards[chosen_idxs:]
