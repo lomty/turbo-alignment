@@ -18,20 +18,16 @@ logger = logging.get_logger(__name__)
 
 class RMTrainer(MultiGPUCherryPicksTrainer):
     """
-    Reward Model Trainer for preference learning.
+    Reward Model Trainer using sequential packing: [context | chosen | rejected].
 
-    Trains a reward model by comparing scores for chosen vs rejected responses.
-    Expects batches from PairPreferenceDataCollator with structure:
-        {
-            'input_ids': Tensor[2*batch_size, seq_len],  # chosen first, then rejected
-            'attention_mask': Tensor[2*batch_size, seq_len],
-            'labels': Tensor[2*batch_size, seq_len],
-            'chosen_idxs': int,  # batch_size, used to split chosen/rejected
-            'precomputed_margin': Optional[Tensor[batch_size]]
-        }
+    Processes all segments in a single forward pass. Extracts rewards at chosen_indices
+    and rejected_indices, then computes ranking loss: -log(sigmoid(reward_chosen - reward_rejected)).
 
-    The collator concatenates chosen and rejected inputs along batch dimension for efficient
-    forward pass. The trainer splits rewards at chosen_idxs for loss computation.
+    Expected batch from PairPreferenceDataCollator:
+        - 'input_ids': Sequentially packed sequences
+        - 'attention_mask': 4D masks with chosen/rejected isolation
+        - 'position_ids': Symmetric positions
+        - 'chosen_indices', 'rejected_indices': Reward extraction positions
     """
 
     def compute_loss(
@@ -42,29 +38,20 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             num_items_in_batch=None,  # pylint: disable=unused-argument
     ) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
-        Compute ranking loss for reward model.
+        Compute ranking loss from sequentially packed inputs.
 
-        Args:
-            model: Reward model
-            inputs: Batch dictionary with concatenated chosen/rejected inputs
-            return_outputs: If True, return (loss, outputs_dict)
-            num_items_in_batch: Unused, kept for API compatibility
+        Extracts rewards at chosen_indices and rejected_indices from model outputs.
 
         Returns:
-            If return_outputs=False: loss scalar
-            If return_outputs=True: (loss, {'rewards_w': Tensor[batch_size],
-                                            'rewards_l': Tensor[batch_size]})
-
-        Loss computation:
-            loss = -log(sigmoid(rewards_w - rewards_l)).mean()
-            Encourages chosen rewards > rejected rewards
+            loss or (loss, {'rewards_w': chosen_rewards, 'rewards_l': rejected_rewards})
         """
-        device = self.accelerator.device
-        input_ids = inputs['st_input_ids'].to(device)
-        position_ids = inputs['st_position_ids'].to(device)
-        attention_mask = inputs['st_attention_mask'].to(device)
-        attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
 
+        device = self.accelerator.device
+        input_ids = inputs['input_ids'].to(device)
+        attention_mask = inputs['attention_mask'].to(device)
+        position_ids = inputs['position_ids'].to(device)
+
+        attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
         hidden_states = model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -74,15 +61,13 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
 
         batch_size = input_ids.shape[0]
-        # Extract rewards using pre-computed indices
-        chosen_indices = inputs['st_chosen_indices'].to(device)
-        rejected_indices = inputs['st_rejected_indices'].to(device)
+        # Extract rewards at segment boundaries from the sequentially packed sequence
+        chosen_indices = inputs['chosen_indices'].to(device)
+        rejected_indices = inputs['rejected_indices'].to(device)
 
-        chosen_idxs = inputs['chosen_idxs']
-        rewards_w = logits[torch.arange(chosen_idxs, device=logits.device), chosen_indices]
-        rewards_l = logits[torch.arange(chosen_idxs, batch_size, device=logits.device), rejected_indices]
+        rewards_w = logits[torch.arange(batch_size, device=logits.device), chosen_indices]
+        rewards_l = logits[torch.arange(batch_size, device=logits.device), rejected_indices]
 
-        # Compute ranking loss: chosen should have higher reward than rejected
         loss = -torch.nn.functional.logsigmoid(rewards_w - rewards_l).mean()
 
         if return_outputs:
@@ -90,11 +75,11 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         return loss
 
     def prediction_step(  # type: ignore[override]  #  pylint: disable=signature-differs
-        self,
-        model: PreTrainedModel | nn.Module,
-        inputs: dict[str, dict[str, torch.Tensor]],
-        prediction_loss_only: bool,
-        ignore_keys: list[str] | None,
+            self,
+            model: PreTrainedModel | nn.Module,
+            inputs: dict[str, dict[str, torch.Tensor]],
+            prediction_loss_only: bool,
+            ignore_keys: list[str] | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         inputs = self._prepare_inputs(inputs)  # type: ignore[arg-type]
         if ignore_keys is None:
