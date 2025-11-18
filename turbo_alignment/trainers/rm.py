@@ -60,20 +60,23 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             Encourages chosen rewards > rejected rewards
         """
         device = self.accelerator.device
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
+        input_ids = inputs['st_input_ids'].to(device)
+        position_ids = inputs['st_position_ids'].to(device)
+        attention_mask = inputs['st_attention_mask'].to(device)
+        attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
 
         hidden_states = model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             use_cache=False,
         ).last_hidden_state
         logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
 
         batch_size = input_ids.shape[0]
         # Extract rewards using pre-computed indices
-        chosen_indices = inputs['chosen_indices'].to(device)
-        rejected_indices = inputs['rejected_indices'].to(device)
+        chosen_indices = inputs['st_chosen_indices'].to(device)
+        rejected_indices = inputs['st_rejected_indices'].to(device)
 
         chosen_idxs = inputs['chosen_idxs']
         rewards_w = logits[torch.arange(chosen_idxs, device=logits.device), chosen_indices]

@@ -7,29 +7,6 @@ from turbo_alignment.constants import DISABLE_LOSS_LABEL
 
 
 class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
-    """
-    Data collator for pair preference datasets (reward model training).
-    Processes chosen/rejected answer pairs by concatenating context with each answer,
-    then batching them together for efficient training.
-    
-    Input format (from dataset):
-        {
-            'inputs_context': Tensor[context_len],
-            'inputs_chosen': Tensor[chosen_len],
-            'inputs_rejected': Tensor[rejected_len],
-            'precomputed_margin': Optional[float]
-        }
-    
-    Output format (batch):
-        {
-            'input_ids': Tensor[2*batch_size, max_seq_len],  # chosen first, then rejected
-            'attention_mask': Tensor[2*batch_size, max_seq_len],
-            'labels': Tensor[2*batch_size, max_seq_len],  # -100 for context, actual tokens for answers
-            'chosen_idxs': int,  # batch_size, used to split chosen/rejected in trainer
-            'precomputed_margin': Optional[Tensor[batch_size]]
-        }
-    """
-
     def __init__(
             self,
             tokenizer: PreTrainedTokenizerBase,
@@ -44,17 +21,33 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         )
         self.add_labels = add_labels
 
-    def _process_example(self, ex: dict) -> tuple[torch.Tensor, torch.Tensor, dict, float | None]:
+    def _process_example(self, ex: dict) -> tuple[torch.Tensor, dict, float | None]:
         """Process a single example into input_ids, labels, boundaries, and margin."""
         context, chosen, rejected = ex['inputs_context'], ex['inputs_chosen'], ex['inputs_rejected']
 
-        chosen_input_ids = torch.cat([context, chosen])
-        rejected_input_ids = torch.cat([context, rejected])
+        # Sequential arrangement: [context | chosen | rejected]
+        input_ids = torch.cat([context, chosen, rejected])
 
         boundaries = {
             'context_end': len(context),
             'chosen_end': len(context) + len(chosen),
-            'rejected_end': len(context)  + len(rejected)
+            'rejected_end': len(context) + len(chosen) + len(rejected)
+        }
+
+        return input_ids, boundaries, ex.get('precomputed_margin')
+
+    def _process_stack_example(self, ex: dict) -> tuple[torch.Tensor, torch.Tensor, dict, float | None]:
+        """Process a single example into input_ids, labels, boundaries, and margin."""
+        context, chosen, rejected = ex['inputs_context'], ex['inputs_chosen'], ex['inputs_rejected']
+
+        # Clone tensors to avoid shared memory references that cause pin_memory errors
+        chosen_input_ids = torch.cat([context, chosen]).clone()
+        rejected_input_ids = torch.cat([context, rejected]).clone()
+
+        boundaries = {
+            'context_end': len(context),
+            'chosen_end': len(context) + len(chosen),
+            'rejected_end': len(context) + len(rejected)
         }
 
         return chosen_input_ids, rejected_input_ids, boundaries, ex.get('precomputed_margin')
@@ -73,7 +66,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
             Tensor[batch_size, 1, max_seq_len, max_seq_len] attention mask
         """
         batch_size = boundaries_tensor.shape[0]
-        mask = torch.zeros((batch_size, 1, max_seq_len, max_seq_len), dtype=torch.float32, device=device)
+        mask = torch.zeros((batch_size, 1, max_seq_len, max_seq_len), dtype=torch.bool, device=device)
 
         # Create position indices for vectorized operations
         positions = torch.arange(max_seq_len, device=device)
@@ -126,104 +119,88 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
 
         return position_ids
 
-    def _get_reward_indices(self, boundaries_tensor: torch.Tensor, max_seq_len: int) -> tuple[
-        torch.Tensor, torch.Tensor]:
-        """
-        Compute indices for extracting rewards at segment boundaries using vectorized operations.
+    def _get_stacked_4d_attention_mask(self, boundaries_list: list[dict], max_seq_len: int,
+                                       device: torch.device) -> torch.Tensor:
 
-        Args:
-            boundaries_tensor: Tensor[batch_size, 3] with [context_end, chosen_end, rejected_end]
-            max_seq_len: Maximum sequence length (for validation)
+        chosen_masks, rejected_masks = [], []
+        # Create position indices for vectorized operations
+        positions = torch.arange(max_seq_len, device=device)
+        row_idx = positions.unsqueeze(1)  # [max_seq_len, 1]
+        col_idx = positions.unsqueeze(0)  # [1, max_seq_len]
 
-        Returns:
-            Tuple of (chosen_indices, rejected_indices) tensors
+        for boundaries in boundaries_list:
+            chosen_end = boundaries['chosen_end']
+            rejected_end = boundaries['rejected_end']
 
-        Raises:
-            ValueError: If any index is out of bounds
-        """
-        # Extract indices (end position - 1)
-        chosen_indices = boundaries_tensor[:, 1] - 1  # chosen_end - 1
-        rejected_indices = boundaries_tensor[:, 2] - 1  # rejected_end - 1
+            # Start with all positions masked (0 = cannot attend)
+            chosen_mask = torch.full((1, max_seq_len, max_seq_len), 0, dtype=torch.bool, device=device)
+            # Set causal attention pattern for valid tokens (0.0 = can attend)
+            causal_pattern = (row_idx < chosen_end) & (col_idx < chosen_end) & (col_idx <= row_idx)
+            chosen_mask[0, causal_pattern] = 1
 
-        max_idx = max(chosen_indices.max().item(), rejected_indices.max().item())
-        if max_idx >= max_seq_len:
-            raise ValueError(
-                f"Reward extraction index {max_idx} out of bounds for padded sequence length {max_seq_len}. "
-                f"Check segment boundaries."
-            )
+            # Start with all positions masked (0 = cannot attend)
+            rejected_mask = torch.full((1, max_seq_len, max_seq_len), 0, dtype=torch.bool, device=device)
+            # Set causal attention pattern for valid tokens (0.0 = can attend)
+            causal_pattern = (row_idx < rejected_end) & (col_idx < rejected_end) & (col_idx <= row_idx)
+            rejected_mask[0, causal_pattern] = 1
 
-        return chosen_indices, rejected_indices
+            chosen_masks.append(chosen_mask)
+            rejected_masks.append(rejected_mask)
+
+        return torch.stack(chosen_masks + rejected_masks)
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:  # type: ignore[override]
         """
         Collate batch of examples from PairPreferenceDataset for reward model training.
-
-        Args:
-            examples: List of example dictionaries, each containing:
-                - inputs_context: torch.Tensor, dtype=torch.long, shape=[context_len]
-                    Token IDs for the context/prompt
-                - inputs_chosen: torch.Tensor, dtype=torch.long, shape=[chosen_len]
-                    Token IDs for the chosen response
-                - inputs_rejected: torch.Tensor, dtype=torch.long, shape=[rejected_len]
-                    Token IDs for the rejected response
-                - precomputed_margin: Optional[float]
-                    Precomputed margin between chosen and rejected scores
-
-        Returns:
-            dict[str, Any]: Batched tensors with the following structure:
-                - input_ids: torch.Tensor, dtype=torch.long, shape=[2*batch_size, max_seq_len]
-                    Concatenated sequences (chosen examples first, then rejected)
-                - attention_mask: torch.Tensor, dtype=torch.long, shape=[2*batch_size, max_seq_len]
-                    Attention mask (1 for valid tokens, 0 for padding)
-                - labels: torch.Tensor, dtype=torch.long, shape=[2*batch_size, max_seq_len]
-                    Labels for training (-100 for context tokens, actual token IDs for answer tokens)
-                - chosen_idxs: int
-                    Split index for chosen/rejected (equals batch_size, used by trainer)
-                - precomputed_margin: Optional[torch.Tensor], dtype=torch.float32, shape=[batch_size]
-                    Precomputed margins if present in input examples
-
-        Process:
-            1. For each example, concatenate context with chosen answer and context with rejected answer
-            2. Use parent DataCollatorForSeq2Seq to pad all features to uniform length
-            3. Add metadata (chosen_idxs, precomputed_margin) for trainer to split and process
         """
+
         processed = [self._process_example(ex) for ex in examples]
-        chosen, rejected, boundaries_list, margins = zip(*processed)
+        concat_input_ids, boundaries_list, _ = zip(*processed)
+
+        st_processed = [self._process_stack_example(ex) for ex in examples]
+        chosen, rejected, st_boundaries_list, _ = zip(*st_processed)
 
         # Use parent class for padding
         batch = super().__call__(
             [{'input_ids': input_ids}
-             for input_ids in  list(chosen) + list(rejected)]
+             for input_ids in concat_input_ids]
         )
         batch['chosen_idxs'] = len(chosen)
-
         device = batch['input_ids'].device
 
-        # To handle both left- and right- padding, we take the rightmost token that is not equal to pad_token_id
-        non_pad_mask = (batch['input_ids'] != self.tokenizer.pad_token_id)
-        token_indices = torch.arange(batch['input_ids'].shape[-1], dtype=torch.int32)
-        last_non_pad_token = (token_indices * non_pad_mask).argmax(-1)
+        batch1 = super().__call__(
+            [{'input_ids': input_ids}
+             for input_ids in list(chosen) + list(rejected)]
+        )
+        batch['st_input_ids'] = batch1['input_ids']
 
-        # print('last_non_pad_token', int(last_non_pad_token[0]),
-        #       [self.tokenizer.decode([batch['input_ids'][0, last_non_pad_token[0]]]), ])
-        # test_inputs = batch['input_ids'][0, last_non_pad_token[0] - 4:last_non_pad_token[0] + 3]
-        # print([self.tokenizer.decode([int(t), ]) for t in test_inputs])
+        batch_size, st_max_seq_len = batch1['input_ids'].shape[:2]
+        # batch['st_attention_mask'] = batch1['attention_mask']
+        batch['st_attention_mask'] = self._get_stacked_4d_attention_mask(
+            list(st_boundaries_list), st_max_seq_len, device
+        )
+
+        batch['st_position_ids'] = torch.arange(st_max_seq_len, dtype=torch.long) \
+            .unsqueeze(0).expand(batch_size, -1).clone()
 
         boundaries_tensor = torch.tensor(
             [[b['context_end'], b['chosen_end'], b['rejected_end']] for b in boundaries_list],
-            dtype=torch.long,
-            device=device
+            dtype=torch.long, device=device
         )
 
-        # Get actual padded length
+        st_boundaries_tensor = torch.tensor(
+            [[b['context_end'], b['chosen_end'], b['rejected_end']] for b in st_boundaries_list],
+            dtype=torch.long, device=device
+        )
+
         batch_size, max_seq_len = batch['input_ids'].shape[:2]
-        # batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)
-        # batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
-        batch['chosen_indices'], batch['rejected_indices'] = self._get_reward_indices(boundaries_tensor, max_seq_len)
+        batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)
+        batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
 
-        assert torch.all(last_non_pad_token[:len(chosen)] == batch['chosen_indices'])
-        assert torch.all(last_non_pad_token[len(chosen):] == batch['rejected_indices'])
+        batch['chosen_indices'], batch['rejected_indices'] = \
+            boundaries_tensor[:, 1] - 1, boundaries_tensor[:, 2] - 1
+        batch['st_chosen_indices'], batch['st_rejected_indices'] = \
+            st_boundaries_tensor[:, 1] - 1, st_boundaries_tensor[:, 2] - 1
 
-        # print('batch_size', batch_size, 'chosen_idxs', batch['chosen_idxs'])
 
         return batch
