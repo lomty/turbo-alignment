@@ -19,6 +19,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         add_labels: Whether to add labels (kept for API compatibility)
         pad_to_multiple_of: Pad sequences to multiple of this value
     """
+
     def __init__(
             self,
             tokenizer: PreTrainedTokenizerBase,
@@ -33,13 +34,13 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         )
         self.add_labels = add_labels
 
-    def _process_example(self, ex: dict) -> tuple[torch.Tensor, dict, float | None]:
+    def _process_example(self, ex: dict) -> tuple[torch.Tensor, tuple[int, int, int], float | None]:
         """
         Pack example into sequential format: [context | chosen | rejected].
 
         Returns:
             - input_ids: Concatenated tensor
-            - boundaries: Dict with 'context_end', 'chosen_end', 'rejected_end'
+            - boundaries: Tuple (context_end, chosen_end, rejected_end)
             - precomputed_margin: Optional margin value
         """
         context, chosen, rejected = ex['inputs_context'], ex['inputs_chosen'], ex['inputs_rejected']
@@ -47,15 +48,16 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         # Sequential arrangement: [context | chosen | rejected]
         input_ids = torch.cat([context, chosen, rejected])
 
-        boundaries = {
-            'context_end': len(context),
-            'chosen_end': len(context) + len(chosen),
-            'rejected_end': len(context) + len(chosen) + len(rejected)
-        }
+        boundaries = (
+            len(context),                               # context_end
+            len(context) + len(chosen),                 # chosen_end
+            len(context) + len(chosen) + len(rejected)  # rejected_end
+        )
 
         return input_ids, boundaries, ex.get('precomputed_margin')
 
-    def _get_attn_mask(self, boundaries_tensor: torch.Tensor, max_seq_len: int, device: torch.device) -> torch.Tensor:
+    def _get_attn_mask(self, boundaries: list[tuple[int, int, int]], max_seq_len: int,
+                       device: torch.device) -> torch.Tensor:
         """
         Create 4D attention mask enforcing chosen/rejected isolation.
 
@@ -65,7 +67,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         Returns:
             Tensor[batch_size, 1, max_seq_len, max_seq_len] where 1 = attend, 0 = mask
         """
-        batch_size = boundaries_tensor.shape[0]
+        batch_size = len(boundaries)
         mask = torch.zeros((batch_size, 1, max_seq_len, max_seq_len), dtype=torch.bool, device=device)
 
         # Create position indices for vectorized operations
@@ -73,7 +75,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         row_idx = positions.unsqueeze(1)  # [max_seq_len, 1]
         col_idx = positions.unsqueeze(0)  # [1, max_seq_len]
 
-        for i, (ctx_end, chosen_end, rejected_end) in enumerate(boundaries_tensor):
+        for i, (ctx_end, chosen_end, rejected_end) in enumerate(boundaries):
             # Context: causal attention (lower triangular)
             context_mask = (row_idx < ctx_end) & (col_idx < ctx_end) & (col_idx <= row_idx)
 
@@ -93,7 +95,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
 
         return mask
 
-    def _get_position_ids(self, boundaries_tensor: torch.Tensor, max_seq_len: int) -> torch.Tensor:
+    def _get_position_ids(self, boundaries: list[tuple[int, int, int]], max_seq_len: int) -> torch.Tensor:
         """
         Compute symmetric position IDs: rejected segment mirrors chosen positions.
 
@@ -102,11 +104,11 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         Returns:
             Tensor[batch_size, max_seq_len] position IDs
         """
-        batch_size = boundaries_tensor.shape[0]
+        batch_size = len(boundaries)
         base_positions = torch.arange(max_seq_len, dtype=torch.long)
         position_ids = base_positions.unsqueeze(0).expand(batch_size, max_seq_len).clone()
 
-        for i, (ctx_end, chosen_end, rejected_end) in enumerate(boundaries_tensor):
+        for i, (ctx_end, chosen_end, rejected_end) in enumerate(boundaries):
             # Overwrite rejected segment with positions starting from ctx_end
             position_ids[i, chosen_end:rejected_end] = base_positions[ctx_end:ctx_end + rejected_end - chosen_end]
 
@@ -125,25 +127,18 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         """
 
         processed = [self._process_example(ex) for ex in examples]
-        concat_input_ids, boundaries_list, _ = zip(*processed)
+        concat_input_ids, boundaries, _ = zip(*processed)
 
         # Use parent class for padding
-        batch = super().__call__(
-            [{'input_ids': input_ids}
-             for input_ids in concat_input_ids]
-        )
+        batch = super().__call__([{'input_ids': input_ids}
+                                  for input_ids in concat_input_ids])
         device = batch['input_ids'].device
 
-        boundaries_tensor = torch.tensor(
-            [[b['context_end'], b['chosen_end'], b['rejected_end']] for b in boundaries_list],
-            dtype=torch.long, device=device
-        )
-
         batch_size, max_seq_len = batch['input_ids'].shape[:2]
-        batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)
-        batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
+        batch['attention_mask'] = self._get_attn_mask(boundaries, max_seq_len, device)
+        batch['position_ids'] = self._get_position_ids(boundaries, max_seq_len)
 
-        batch['chosen_indices'], batch['rejected_indices'] = \
-            boundaries_tensor[:, 1] - 1, boundaries_tensor[:, 2] - 1
+        batch['chosen_indices'] = torch.tensor([b[1] - 1 for b in boundaries], dtype=torch.long, device=device)
+        batch['rejected_indices'] = torch.tensor([b[2] - 1 for b in boundaries], dtype=torch.long, device=device)
 
         return batch
