@@ -53,8 +53,6 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         attention_mask = inputs['attention_mask'].to(device)
         position_ids = inputs['position_ids'].to(device)
 
-        attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
-
         if parallel_states.sequence_parallel_is_initialized():
             input_ids = pad_for_sequence_parallel(
                 input_ids,
@@ -80,6 +78,8 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             end = chunk_size * (parallel_states.get_sequence_parallel_rank() + 1)
             input_ids = input_ids[:, start:end].clone()
             position_ids = position_ids[:, start:end].clone()
+
+        attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
 
         hidden_states = model.model(
             input_ids=input_ids,
