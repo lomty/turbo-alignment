@@ -11,6 +11,8 @@ from transformers.trainer_pt_utils import nested_detach
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
+from transformers.modeling_attn_mask_utils import AttentionMaskConverter
+
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
 from turbo_alignment.trainers.utils import concatenated_inputs
 from turbo_alignment.sequence_parallel.collator import pad_for_sequence_parallel
@@ -25,6 +27,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
 
         input_ids = concatenated_batch['input_ids']
         attention_mask = concatenated_batch['attention_mask']
+        position_ids = None
 
         if parallel_states.sequence_parallel_is_initialized():
             input_ids = pad_for_sequence_parallel(
@@ -40,12 +43,29 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                 padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
             )
 
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 0)
+
+            batch_size, seq_length = input_ids.shape
+            sliding_window = getattr(model.config, "sliding_window", None)
+
+            converter = AttentionMaskConverter(is_causal=True, sliding_window=sliding_window)
+            attention_mask = converter.to_4d(
+                attention_mask,
+                seq_length,
+                dtype=model.dtype,
+                key_value_length=seq_length,
+            )
+
             chunk_size = input_ids.size(-1) // parallel_states.get_sequence_parallel_world_size()
             start = chunk_size * parallel_states.get_sequence_parallel_rank()
             end = chunk_size * (parallel_states.get_sequence_parallel_rank() + 1)
             input_ids = input_ids[:, start:end].clone()
+            position_ids = position_ids[:, start:end].clone()
 
-        all_rewards = model(input_ids, attention_mask=attention_mask, return_dict=True)[0]
+        all_rewards = model(
+            input_ids, attention_mask=attention_mask, position_ids=position_ids, return_dict=True
+        )[0]
 
         chosen_idxs = batch['inputs_w']['input_ids'].shape[0]
 
