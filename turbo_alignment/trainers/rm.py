@@ -60,6 +60,15 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                 self.tokenizer.pad_token_id,  # type: ignore[union-attr]
                 padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
             )
+            if attention_mask.dim() == 4:
+                attention_mask = pad_for_sequence_parallel(
+                    attention_mask,
+                    parallel_states.get_sequence_parallel_world_size(),
+                    0,
+                    dim=2,
+                    padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
+                )
+
             attention_mask = pad_for_sequence_parallel(
                 attention_mask,
                 parallel_states.get_sequence_parallel_world_size(),
