@@ -260,8 +260,15 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
         # BEGIN OF PATCH
-        if parallel_states.sequence_parallel_is_initialized():
-            sequence_length = sequence_length * parallel_states.get_sequence_parallel_world_size()
+        # if parallel_states.sequence_parallel_is_initialized():
+        #     sequence_length = sequence_length * parallel_states.get_sequence_parallel_world_size()
+        try:
+            sp_world_size = parallel_states.get_sequence_parallel_world_size()
+        except AssertionError:
+            sp_world_size = 1
+
+        if sp_world_size > 1:
+            sequence_length = sequence_length * sp_world_size
         # END OF PATCH
         # SlidingWindowCache or StaticCache
         if using_sliding_window_cache or using_static_cache:
