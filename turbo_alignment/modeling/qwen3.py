@@ -288,8 +288,8 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
         # BEGIN OF PATCH
-        # if parallel_states.sequence_parallel_is_initialized():
-        #     sequence_length = sequence_length * parallel_states.get_sequence_parallel_world_size()
+        if parallel_states.sequence_parallel_is_initialized():
+            sequence_length = sequence_length * parallel_states.get_sequence_parallel_world_size()
         # END OF PATCH
         # SlidingWindowCache or StaticCache
         if using_sliding_window_cache or using_static_cache:
@@ -302,44 +302,20 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
                 else past_seen_tokens + sequence_length + 1
             )
             # HACK
-            if cache_position is None:
-                cache_position = torch.arange(0, sequence_length, device=input_tensor.device)
+            cache_position = torch.arange(0, sequence_length, device=input_tensor.device)
 
-        if parallel_states.sequence_parallel_is_initialized():
-            mask = torch.full((sequence_length, target_length), min_dtype, device=device, dtype=dtype)
-            i_idxs = cache_position.view(-1, 1)
-            j_idxs = torch.arange(target_length, device=device).view(1, -1)
-            mask.masked_fill_(j_idxs <= i_idxs, 0)
-            if self.config.sliding_window is not None:
-                mask.masked_fill_(j_idxs < i_idxs - self.config.sliding_window, min_dtype)
-
-            causal_mask = mask[None, None, :, :]
-            if attention_mask is not None:
-                if attention_mask.dim() == 2:
-                    padding_mask = attention_mask[:, None, None, :]
-                    if attention_mask.min() < -1:
-                        causal_mask = causal_mask + padding_mask
-                    else:
-                        causal_mask = causal_mask + (1.0 - padding_mask) * min_dtype
-                elif attention_mask.dim() == 4:
-                    rank = parallel_states.get_sequence_parallel_rank()
-                    start = rank * sequence_length
-                    end = start + sequence_length
-                    sliced_mask = attention_mask[:, :, start:end, :]
-                    causal_mask = causal_mask + sliced_mask
-        else:
-            # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-            causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-                attention_mask,
-                sequence_length=sequence_length,
-                target_length=target_length,
-                dtype=dtype,
-                device=device,
-                cache_position=cache_position,
-                batch_size=input_tensor.shape[0],
-                config=self.config,
-                past_key_values=past_key_values,
-            )
+        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+            attention_mask,
+            sequence_length=sequence_length,
+            target_length=target_length,
+            dtype=dtype,
+            device=device,
+            cache_position=cache_position,
+            batch_size=input_tensor.shape[0],
+            config=self.config,
+            past_key_values=past_key_values,
+        )
 
         if (
             self.config._attn_implementation == "sdpa"
@@ -409,11 +385,8 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             # HACK
-            sequence_length = inputs_embeds.size(1)  # * parallel_states.get_sequence_parallel_world_size_or_one()
-            start_token = 0
-            if parallel_states.sequence_parallel_is_initialized():
-                start_token = parallel_states.get_sequence_parallel_rank() * sequence_length
-            cache_position = torch.arange(start_token, start_token + sequence_length, device=inputs_embeds.device)
+            sequence_length = inputs_embeds.size(1) * parallel_states.get_sequence_parallel_world_size_or_one()
+            cache_position = torch.arange(0, sequence_length, device=inputs_embeds.device)
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
