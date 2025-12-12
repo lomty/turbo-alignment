@@ -302,20 +302,34 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
                 else past_seen_tokens + sequence_length + 1
             )
             # HACK
-            cache_position = torch.arange(0, sequence_length, device=input_tensor.device)
+            if cache_position is None:
+                cache_position = torch.arange(0, sequence_length, device=input_tensor.device)
 
-        # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask,
-            sequence_length=sequence_length,
-            target_length=target_length,
-            dtype=dtype,
-            device=device,
-            cache_position=cache_position,
-            batch_size=input_tensor.shape[0],
-            config=self.config,
-            past_key_values=past_key_values,
-        )
+        if parallel_states.sequence_parallel_is_initialized():
+            mask = torch.full((sequence_length, target_length), min_dtype, device=device, dtype=dtype)
+            i_idxs = cache_position.view(-1, 1)
+            j_idxs = torch.arange(target_length, device=device).view(1, -1)
+            mask.masked_fill_(j_idxs <= i_idxs, 0)
+            if self.config.sliding_window is not None:
+                mask.masked_fill_(j_idxs < i_idxs - self.config.sliding_window, min_dtype)
+
+            causal_mask = mask[None, None, :, :]
+            if attention_mask is not None:
+                padding_mask = attention_mask[:, None, None, :]
+                causal_mask = causal_mask + (1.0 - padding_mask) * min_dtype
+        else:
+            # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
+            causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
+                attention_mask,
+                sequence_length=sequence_length,
+                target_length=target_length,
+                dtype=dtype,
+                device=device,
+                cache_position=cache_position,
+                batch_size=input_tensor.shape[0],
+                config=self.config,
+                past_key_values=past_key_values,
+            )
 
         if (
             self.config._attn_implementation == "sdpa"
