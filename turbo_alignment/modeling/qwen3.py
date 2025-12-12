@@ -37,6 +37,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
     QWEN3_INPUTS_DOCSTRING,
     logger,
 )
+import torch.distributed as dist
 from transformers.utils.doc import add_start_docstrings, add_start_docstrings_to_model_forward
 from transformers.utils.generic import can_return_tuple
 from turbo_alignment.modeling import parallel_states
@@ -47,6 +48,29 @@ from turbo_alignment.sequence_parallel.generation import GenerationMixinWithSeqP
 from turbo_alignment.sequence_parallel.vocab_parallel_cross_entropy import (
     vocab_sequence_parallel_cross_entropy_loss,
 )
+
+
+class GatherSeq(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, group):
+        ctx.group = group
+        world_size = dist.get_world_size(group)
+        if world_size <= 1:
+            return input
+        output_list = [torch.empty_like(input) for _ in range(world_size)]
+        dist.all_gather(output_list, input, group=group)
+        return torch.cat(output_list, dim=2)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        world_size = dist.get_world_size(group)
+        if world_size <= 1:
+            return grad_output, None
+        rank = dist.get_rank(group)
+        dim = 2
+        chunks = torch.chunk(grad_output, world_size, dim=dim)
+        return chunks[rank], None
 
 
 class Qwen3Attention(nn.Module):
@@ -120,12 +144,15 @@ class Qwen3Attention(nn.Module):
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         spg = parallel_states.get_sequence_parallel_group()
-        scatter_idx = 1
-        gather_idx = 2
+        # scatter_idx = 1
+        # gather_idx = 2
 
-        query_states = _SeqAllToAll().apply(spg, query_states, scatter_idx, gather_idx)
-        key_states = _SeqAllToAll().apply(spg, key_states, scatter_idx, gather_idx)
-        value_states = _SeqAllToAll().apply(spg, value_states, scatter_idx, gather_idx)
+        # query_states = _SeqAllToAll().apply(spg, query_states, scatter_idx, gather_idx)
+        # key_states = _SeqAllToAll().apply(spg, key_states, scatter_idx, gather_idx)
+        # value_states = _SeqAllToAll().apply(spg, value_states, scatter_idx, gather_idx)
+
+        key_states = GatherSeq.apply(key_states, spg)
+        value_states = GatherSeq.apply(value_states, spg)
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -139,7 +166,7 @@ class Qwen3Attention(nn.Module):
             **kwargs,
         )
 
-        attn_output = _SeqAllToAll().apply(spg, attn_output, scatter_idx, gather_idx)
+        # attn_output = _SeqAllToAll().apply(spg, attn_output, scatter_idx, gather_idx)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -262,13 +289,6 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         # BEGIN OF PATCH
         # if parallel_states.sequence_parallel_is_initialized():
         #     sequence_length = sequence_length * parallel_states.get_sequence_parallel_world_size()
-        try:
-            sp_world_size = parallel_states.get_sequence_parallel_world_size()
-        except AssertionError:
-            sp_world_size = 1
-
-        if sp_world_size > 1:
-            sequence_length = sequence_length * sp_world_size
         # END OF PATCH
         # SlidingWindowCache or StaticCache
         if using_sliding_window_cache or using_static_cache:
