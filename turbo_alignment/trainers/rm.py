@@ -89,6 +89,10 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         ).last_hidden_state
         logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
 
+        if parallel_states.sequence_parallel_is_initialized():
+            from turbo_alignment.sequence_parallel.gather_logits import GatherAllLogits
+            logits = GatherAllLogits.apply(logits, parallel_states.get_sequence_parallel_group())
+
         batch_size = input_ids.shape[0]
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
