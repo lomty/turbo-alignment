@@ -315,8 +315,18 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
 
             causal_mask = mask[None, None, :, :]
             if attention_mask is not None:
-                padding_mask = attention_mask[:, None, None, :]
-                causal_mask = causal_mask + (1.0 - padding_mask) * min_dtype
+                if attention_mask.dim() == 2:
+                    padding_mask = attention_mask[:, None, None, :]
+                    if attention_mask.min() < -1:
+                        causal_mask = causal_mask + padding_mask
+                    else:
+                        causal_mask = causal_mask + (1.0 - padding_mask) * min_dtype
+                elif attention_mask.dim() == 4:
+                    rank = parallel_states.get_sequence_parallel_rank()
+                    start = rank * sequence_length
+                    end = start + sequence_length
+                    sliced_mask = attention_mask[:, :, start:end, :]
+                    causal_mask = causal_mask + sliced_mask
         else:
             # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
             causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
