@@ -385,8 +385,11 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             # HACK
-            sequence_length = inputs_embeds.size(1) * parallel_states.get_sequence_parallel_world_size_or_one()
-            cache_position = torch.arange(0, sequence_length, device=inputs_embeds.device)
+            sequence_length = inputs_embeds.size(1)  # * parallel_states.get_sequence_parallel_world_size_or_one()
+            start_token = 0
+            if parallel_states.sequence_parallel_is_initialized():
+                start_token = parallel_states.get_sequence_parallel_rank() * sequence_length
+            cache_position = torch.arange(start_token, start_token + sequence_length, device=inputs_embeds.device)
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
