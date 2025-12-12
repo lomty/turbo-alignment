@@ -59,6 +59,11 @@ def log_once_unused_keys(keys: tuple[str, ...]):
     logger.info(f'Cannot split values, got keys: {" ".join(keys)}')
 
 
+@lru_cache
+def log_once_none_value(key: str):
+    logger.warning(f"Found None value for key '{key}' in batch. Skipping sequence parallel processing for this key.")
+
+
 class DataCollatorForSequenceParallism:
     def __init__(
         self,
@@ -128,6 +133,10 @@ class DataCollatorForSequenceParallism:
         return key not in self.fields_not_to_split
 
     def prepare_value(self, key: str, value: torch.Tensor, pad_value=None):
+        if value is None:
+            log_once_none_value(key)
+            return None
+
         padded = pad_for_sequence_parallel(
             value,
             self.seq_p_world_size,
