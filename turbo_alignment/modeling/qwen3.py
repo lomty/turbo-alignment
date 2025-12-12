@@ -53,6 +53,7 @@ from turbo_alignment.sequence_parallel.vocab_parallel_cross_entropy import (
 class GatherSeq(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, group):
+        input = input.contiguous()
         ctx.group = group
         world_size = dist.get_world_size(group)
         if world_size <= 1:
