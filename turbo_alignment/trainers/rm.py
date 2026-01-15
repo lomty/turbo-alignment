@@ -64,7 +64,15 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                 attention_mask,
                 parallel_states.get_sequence_parallel_world_size(),
                 0,
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
+                padding_side=self.tokenizer.padding_side,
+                dim=-1 # type: ignore[union-attr]
+            )
+            attention_mask = pad_for_sequence_parallel(
+                attention_mask,
+                parallel_states.get_sequence_parallel_world_size(),
+                0,
+                padding_side=self.tokenizer.padding_side,
+                dim=-2  # type: ignore[union-attr]
             )
             position_ids = pad_for_sequence_parallel(
                 position_ids,
