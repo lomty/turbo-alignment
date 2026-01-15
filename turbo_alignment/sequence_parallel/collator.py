@@ -137,6 +137,9 @@ class DataCollatorForSequenceParallism:
             log_once_none_value(key)
             return None
 
+        if not self.should_be_splitted(key) and value.dim() == 1:
+            return value
+
         padded = pad_for_sequence_parallel(
             value,
             self.seq_p_world_size,
