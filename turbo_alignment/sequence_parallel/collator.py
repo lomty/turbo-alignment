@@ -144,6 +144,16 @@ class DataCollatorForSequenceParallism:
             dim=-1,
             padding_side=self.padding_side,
         )
+
+        if key == 'attention_mask' and padded.dim() == 4:
+            padded = pad_for_sequence_parallel(
+                padded,
+                self.seq_p_world_size,
+                pad_value if pad_value is not None else self.pad_values_for_fields.get(key, 0),
+                dim=-2,
+                padding_side=self.padding_side,
+            )
+
         if self.should_be_splitted(key):
             if not isinstance(padded, torch.Tensor):
                 raise ValueError(f'{key=} {value=} {padded=}')

@@ -13,6 +13,7 @@ from transformers.utils import logging
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
 from turbo_alignment.sequence_parallel.collator import pad_for_sequence_parallel
+from turbo_alignment.sequence_parallel.gather_logits import GatherAllLogits
 from turbo_alignment.modeling import parallel_states
 
 logger = logging.get_logger(__name__)
@@ -53,40 +54,6 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         attention_mask = inputs['attention_mask'].to(device)
         position_ids = inputs['position_ids'].to(device)
 
-        if parallel_states.sequence_parallel_is_initialized():
-            input_ids = pad_for_sequence_parallel(
-                input_ids,
-                parallel_states.get_sequence_parallel_world_size(),
-                self.tokenizer.pad_token_id,  # type: ignore[union-attr]
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-            attention_mask = pad_for_sequence_parallel(
-                attention_mask,
-                parallel_states.get_sequence_parallel_world_size(),
-                0,
-                padding_side=self.tokenizer.padding_side,
-                dim=-1 # type: ignore[union-attr]
-            )
-            attention_mask = pad_for_sequence_parallel(
-                attention_mask,
-                parallel_states.get_sequence_parallel_world_size(),
-                0,
-                padding_side=self.tokenizer.padding_side,
-                dim=-2  # type: ignore[union-attr]
-            )
-            position_ids = pad_for_sequence_parallel(
-                position_ids,
-                parallel_states.get_sequence_parallel_world_size(),
-                position_ids.shape[1],
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-
-            chunk_size = input_ids.size(-1) // parallel_states.get_sequence_parallel_world_size()
-            start = chunk_size * parallel_states.get_sequence_parallel_rank()
-            end = chunk_size * (parallel_states.get_sequence_parallel_rank() + 1)
-            input_ids = input_ids[:, start:end].clone()
-            position_ids = position_ids[:, start:end].clone()
-
         attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
 
         hidden_states = model.model(
@@ -96,6 +63,9 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             use_cache=False,
         ).last_hidden_state
         logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
+
+        if parallel_states.sequence_parallel_is_initialized():
+            logits = GatherAllLogits.apply(logits, parallel_states.get_sequence_parallel_group())
 
         batch_size = input_ids.shape[0]
         # Extract rewards at segment boundaries from the sequentially packed sequence
