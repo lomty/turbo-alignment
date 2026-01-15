@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from peft import PeftModel
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
@@ -64,18 +65,35 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         ).last_hidden_state
         logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
 
-        if parallel_states.sequence_parallel_is_initialized():
-            logits = GatherAllLogits.apply(logits, parallel_states.get_sequence_parallel_group())
-            logger.warning(
-                f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
-
-        batch_size = input_ids.shape[0]
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
         rejected_indices = inputs['rejected_indices'].to(device)
 
-        rewards_w = logits[torch.arange(batch_size, device=logits.device), chosen_indices]
-        rewards_l = logits[torch.arange(batch_size, device=logits.device), rejected_indices]
+        if parallel_states.sequence_parallel_is_initialized():
+            rank = parallel_states.get_sequence_parallel_rank()
+            seq_len_chunk = logits.size(1)
+            offset = rank * seq_len_chunk
+            logger.warning(
+                f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
+
+            def get_rewards(indices):
+                is_local = (indices >= offset) & (indices < offset + seq_len_chunk)
+                local_indices = indices - offset
+                safe_indices = torch.where(is_local, local_indices, torch.zeros_like(local_indices))
+
+                batch_idx = torch.arange(indices.size(0), device=logits.device)
+                rewards = logits[batch_idx, safe_indices].squeeze(-1)
+                rewards = rewards * is_local.to(rewards.dtype)
+
+                dist.all_reduce(rewards, op=dist.ReduceOp.SUM, group=parallel_states.get_sequence_parallel_group())
+                return rewards
+
+            rewards_w = get_rewards(chosen_indices)
+            rewards_l = get_rewards(rejected_indices)
+        else:
+            batch_size = input_ids.shape[0]
+            rewards_w = logits[torch.arange(batch_size, device=logits.device), chosen_indices]
+            rewards_l = logits[torch.arange(batch_size, device=logits.device), rejected_indices]
 
         loss = -torch.nn.functional.logsigmoid(rewards_w - rewards_l).mean()
 
