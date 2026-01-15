@@ -66,6 +66,8 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
 
         if parallel_states.sequence_parallel_is_initialized():
             logits = GatherAllLogits.apply(logits, parallel_states.get_sequence_parallel_group())
+            logger.warning(
+                f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
 
         batch_size = input_ids.shape[0]
         # Extract rewards at segment boundaries from the sequentially packed sequence
