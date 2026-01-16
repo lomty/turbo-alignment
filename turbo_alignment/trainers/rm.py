@@ -13,8 +13,6 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
-from turbo_alignment.sequence_parallel.collator import pad_for_sequence_parallel
-from turbo_alignment.sequence_parallel.gather_logits import GatherAllLogits
 from turbo_alignment.modeling import parallel_states
 
 logger = logging.get_logger(__name__)
@@ -73,8 +71,8 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             rank = parallel_states.get_sequence_parallel_rank()
             seq_len_chunk = logits.size(1)
             offset = rank * seq_len_chunk
-            logger.warning(
-                f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
+            # logger.warning(
+            #     f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
 
             def get_rewards(indices):
                 is_local = (indices >= offset) & (indices < offset + seq_len_chunk)
