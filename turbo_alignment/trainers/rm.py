@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from peft import PeftModel
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
@@ -12,7 +13,6 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
-from turbo_alignment.sequence_parallel.collator import pad_for_sequence_parallel
 from turbo_alignment.modeling import parallel_states
 
 logger = logging.get_logger(__name__)
@@ -53,41 +53,6 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         attention_mask = inputs['attention_mask'].to(device)
         position_ids = inputs['position_ids'].to(device)
 
-        if parallel_states.sequence_parallel_is_initialized():
-            input_ids = pad_for_sequence_parallel(
-                input_ids,
-                parallel_states.get_sequence_parallel_world_size(),
-                self.tokenizer.pad_token_id,  # type: ignore[union-attr]
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-            if attention_mask.dim() == 4:
-                attention_mask = pad_for_sequence_parallel(
-                    attention_mask,
-                    parallel_states.get_sequence_parallel_world_size(),
-                    0,
-                    dim=2,
-                    padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-                )
-
-            attention_mask = pad_for_sequence_parallel(
-                attention_mask,
-                parallel_states.get_sequence_parallel_world_size(),
-                0,
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-            position_ids = pad_for_sequence_parallel(
-                position_ids,
-                parallel_states.get_sequence_parallel_world_size(),
-                position_ids.shape[1],
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-
-            chunk_size = input_ids.size(-1) // parallel_states.get_sequence_parallel_world_size()
-            start = chunk_size * parallel_states.get_sequence_parallel_rank()
-            end = chunk_size * (parallel_states.get_sequence_parallel_rank() + 1)
-            input_ids = input_ids[:, start:end].clone()
-            position_ids = position_ids[:, start:end].clone()
-
         attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
 
         hidden_states = model.model(
@@ -98,17 +63,35 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         ).last_hidden_state
         logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
 
-        if parallel_states.sequence_parallel_is_initialized():
-            from turbo_alignment.sequence_parallel.gather_logits import GatherAllLogits
-            logits = GatherAllLogits.apply(logits, parallel_states.get_sequence_parallel_group())
-
-        batch_size = input_ids.shape[0]
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
         rejected_indices = inputs['rejected_indices'].to(device)
 
-        rewards_w = logits[torch.arange(batch_size, device=logits.device), chosen_indices]
-        rewards_l = logits[torch.arange(batch_size, device=logits.device), rejected_indices]
+        if parallel_states.sequence_parallel_is_initialized():
+            rank = parallel_states.get_sequence_parallel_rank()
+            seq_len_chunk = logits.size(1)
+            offset = rank * seq_len_chunk
+            # logger.warning(
+            #     f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
+
+            def get_rewards(indices):
+                is_local = (indices >= offset) & (indices < offset + seq_len_chunk)
+                local_indices = indices - offset
+                safe_indices = torch.where(is_local, local_indices, torch.zeros_like(local_indices))
+
+                batch_idx = torch.arange(indices.size(0), device=logits.device)
+                rewards = logits[batch_idx, safe_indices].squeeze(-1)
+                rewards = rewards * is_local.to(rewards.dtype)
+
+                dist.all_reduce(rewards, op=dist.ReduceOp.SUM, group=parallel_states.get_sequence_parallel_group())
+                return rewards
+
+            rewards_w = get_rewards(chosen_indices)
+            rewards_l = get_rewards(rejected_indices)
+        else:
+            batch_size = input_ids.shape[0]
+            rewards_w = logits[torch.arange(batch_size, device=logits.device), chosen_indices]
+            rewards_l = logits[torch.arange(batch_size, device=logits.device), rejected_indices]
 
         loss = -torch.nn.functional.logsigmoid(rewards_w - rewards_l).mean()
 
