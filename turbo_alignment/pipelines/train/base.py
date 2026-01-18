@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Generic, TypeVar
 
 import torch
-from torch.utils.data import ConcatDataset, Dataset
+from torch.utils.data import ChainDataset, ConcatDataset, Dataset, IterableDataset
 from transformers import (
     PreTrainedTokenizerBase,
     TrainingArguments,
@@ -163,23 +163,29 @@ class BaseTrainStrategy(S3Mixin, BaseStrategy, Generic[ExperimentSettingsT, Trai
 
             special_tokens_setter.setup_model_config(self.model)
 
-            train_dataset: ConcatDataset = ConcatDataset(
-                datasets=DatasetLoader().load_datasets(
-                    experiment_settings.train_dataset_settings,
-                    tokenizer=self.tokenizer,
-                    strategy=DatasetStrategy.TRAIN,
-                    seed=experiment_settings.seed,
-                )
+            train_datasets = DatasetLoader().load_datasets(
+                experiment_settings.train_dataset_settings,
+                tokenizer=self.tokenizer,
+                strategy=DatasetStrategy.TRAIN,
+                seed=experiment_settings.seed,
             )
 
-            val_dataset: ConcatDataset = ConcatDataset(
-                datasets=DatasetLoader().load_datasets(
-                    experiment_settings.val_dataset_settings,
-                    tokenizer=self.tokenizer,
-                    strategy=DatasetStrategy.TRAIN,
-                    seed=experiment_settings.seed,
-                )
+            if any(isinstance(d, IterableDataset) for d in train_datasets):
+                train_dataset = ChainDataset(train_datasets)
+            else:
+                train_dataset = ConcatDataset(datasets=train_datasets)
+
+            val_datasets = DatasetLoader().load_datasets(
+                experiment_settings.val_dataset_settings,
+                tokenizer=self.tokenizer,
+                strategy=DatasetStrategy.TRAIN,
+                seed=experiment_settings.seed,
             )
+
+            if any(isinstance(d, IterableDataset) for d in val_datasets):
+                val_dataset = ChainDataset(val_datasets)
+            else:
+                val_dataset = ConcatDataset(datasets=val_datasets)
 
             data_collator = self._get_data_collator(experiment_settings, self.tokenizer)
             if experiment_settings.trainer_settings.sequence_parallel > 1:

@@ -146,4 +146,5 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         batch['chosen_indices'] = boundaries_tensor[:, 1] - 1
         batch['rejected_indices'] = boundaries_tensor[:, 2] - 1
 
-        return batch
+        #TODO: remove this monkey patch when possible
+        return {k: v for k, v in batch.items() if v is not None}

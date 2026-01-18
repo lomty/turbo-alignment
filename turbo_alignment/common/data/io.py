@@ -18,6 +18,11 @@ def read_jsonl(path: Path):
         return [json.loads(line) for line in f]
 
 
+def count_lines(path: Path) -> int:
+    with path.open(encoding='utf-8') as f:
+        return sum(1 for _ in f)
+
+
 def write_jsonl(records: Any, path: Path, mode='w') -> None:
     with path.open(mode, encoding='utf-8') as f:
         for r in records:
