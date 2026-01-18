@@ -65,9 +65,11 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
             pass
         self.__class__ = IterablePairPreferenceDataset
 
-    def _build_chat_record(self, record: PairPreferenceRecord, answer: ChatMessage) -> ChatDatasetRecord:
-        context_messages = [ChatMessage(role=msg.role, content=msg.content, disable_loss=True)
-                            for msg in record.context]
+    def _to_chat_record(self, record: PairPreferenceRecord, answer: ChatMessage) -> ChatDatasetRecord:
+        context_messages = [
+            ChatMessage(role=msg.role, content=msg.content, disable_loss=True)
+            for msg in record.context
+        ]
         return ChatDatasetRecord(id=record.id, messages=context_messages + [answer])
 
     def _process_batch(self, batch: dict[str, list]) -> dict[str, list]:
@@ -81,35 +83,33 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
             Dict with lists of processed values
         """
         batch_size = len(batch["context"])
-        records = []
-        
-        # 1. Convert HF batch to PairPreferenceRecord objects
-        for i in range(batch_size):
-            # context is a list of dicts (messages), need to ensure it parses correctly
-            # batch['context'][i] is a list of dicts, which Pydantic should handle
-            records.append(PairPreferenceRecord(
-                id=batch.get("id", [""] * batch_size)[i],
-                context=batch["context"][i],
-                answer_w=batch["answer_w"][i],
-                answer_l=batch["answer_l"][i],
-                precomputed_margin=batch.get("precomputed_margin", [None] * batch_size)[i],
-            ))
 
-        # 2. Build chat records for chosen and rejected
-        chosen_chat_records = [
-            self._build_chat_record(r, ChatMessage(role=r.answer_w.role, content=r.answer_w.content))
-            for r in records
-        ]
-        rejected_chat_records = [
-            self._build_chat_record(r, ChatMessage(role=r.answer_l.role, content=r.answer_l.content))
-            for r in records
+        records = [
+            PairPreferenceRecord(
+                id=id_,
+                context=context,
+                answer_w=ans_w,
+                answer_l=ans_l,
+                precomputed_margin=margin,
+            )
+            for id_, context, ans_w, ans_l, margin in zip(
+                batch.get("id", [""] * batch_size),
+                batch["context"],
+                batch["answer_w"],
+                batch["answer_l"],
+                batch.get("precomputed_margin", [None] * batch_size),
+            )
         ]
 
-        # 3. Use existing SplitChatDataset to tokenize
+        # Build chat records for chosen and rejected
+        chosen_chat_records = [self._to_chat_record(r, r.answer_w) for r in records]
+        rejected_chat_records = [self._to_chat_record(r, r.answer_l) for r in records]
+
+        # Use existing SplitChatDataset to tokenize
         tokenized_chosen = self._chat_dataset.convert_records(chosen_chat_records)
         tokenized_rejected = self._chat_dataset.convert_records(rejected_chat_records)
 
-        # 4. Reassemble results
+        # Reassemble results
         results = {
             "id": [],
             "inputs_context": [],
@@ -119,44 +119,32 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
             "_valid": [],
         }
 
-        for i in range(batch_size):
-            chosen_tok = tokenized_chosen[i]
-            rejected_tok = tokenized_rejected[i]
-            
-            if chosen_tok is not None and rejected_tok is not None:
-                results["id"].append(records[i].id)
-                # Convert tensors to lists for Arrow storage
-                # Note: SplitChatDataset returns 1D tensors, so no need to squeeze
-                results["inputs_context"].append(chosen_tok['context_ids'].tolist()) 
-                results["inputs_chosen"].append(chosen_tok['answer_ids'].tolist())
-                results["inputs_rejected"].append(rejected_tok['answer_ids'].tolist())
-                results["precomputed_margin"].append(records[i].precomputed_margin)
-                results["_valid"].append(True)
-            else:
-                # Invalid record (filtered out by truncation logic)
-                results["id"].append("")
-                results["inputs_context"].append([])
-                results["inputs_chosen"].append([])
-                results["inputs_rejected"].append([])
-                results["precomputed_margin"].append(None)
-                results["_valid"].append(False)
-        
+        for r, chosen, rejected in zip(records, tokenized_chosen, tokenized_rejected):
+            is_valid = chosen is not None and rejected is not None
+
+            results["id"].append(r.id if is_valid else "")
+            results["inputs_context"].append(chosen['context_ids'].tolist() if is_valid else [])
+            results["inputs_chosen"].append(chosen['answer_ids'].tolist() if is_valid else [])
+            results["inputs_rejected"].append(rejected['answer_ids'].tolist() if is_valid else [])
+            results["precomputed_margin"].append(r.precomputed_margin if is_valid else None)
+            results["_valid"].append(is_valid)
+
         return results
 
     def _load_dataset(self) -> HFIterableDataset:
-
         if self.source.records_data:
-            raise NotImplementedError("Loading from records_data (in-memory list) not fully supported with HF datasets yet.")
-        
+            raise NotImplementedError(
+                "Loading from records_data (in-memory list) not fully supported with HF datasets yet."
+            )
+
         data_path = self.source.records_path or self.source.train_path
         if not data_path:
-             raise ValueError('At least one of records_data and records_path should be not None')
-        
+            raise ValueError('At least one of records_data and records_path should be not None')
+
         data_path = Path(data_path)
         logger.info(f"Loading dataset from {data_path} in producer-consumer mode (HF machinery)...")
-        
-        # 1. Load as streaming dataset (lazy)
-        # HF handles sharding automatically for JSON/JSONL when using num_workers
+
+        # Load as streaming dataset (lazy)
         raw_dataset = load_dataset(
             "json",
             data_files=str(data_path),
@@ -164,28 +152,18 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
             streaming=True,
         )
 
-        # 2. Apply tokenization on-the-fly
-        # This will run in worker processes
-        
-        # safely determine columns to remove
-        remove_columns = None
-        if hasattr(raw_dataset, 'features') and raw_dataset.features is not None:
-            remove_columns = list(raw_dataset.features.keys())
-            
+        # Apply tokenization on-the-fly
+        remove_columns = list(raw_dataset.features.keys()) if getattr(raw_dataset, "features", None) else None
+
         processed_dataset = raw_dataset.map(
             self._process_batch,
             batched=True,
             batch_size=self._hf_settings.tokenization_batch_size,
-            remove_columns=remove_columns
+            remove_columns=remove_columns,
         )
 
-        # 3. Filter invalid
-        processed_dataset = processed_dataset.filter(lambda x: x["_valid"])
-        processed_dataset = processed_dataset.remove_columns(["_valid"])
-
-        # 4. Shuffle buffer
-        # Essential for streaming to avoid correlation
-        return processed_dataset.shuffle(
+        # Filter invalid and shuffle
+        return processed_dataset.filter(lambda x: x["_valid"]).remove_columns(["_valid"]).shuffle(
             seed=self.seed,
             buffer_size=self._hf_settings.streaming_buffer_size,
         )
@@ -234,12 +212,8 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
     # Kept for compatibility with base class, though unused by new logic
     def convert_records(self, records: list[PairPreferenceRecord]) -> list[dict[str, Any] | None]:
         # Build chat records for chosen and rejected using helper method
-        chosen_chat_records = [
-            self._build_chat_record(record, ChatMessage(role=record.answer_w.role, content=record.answer_w.content))
-            for record in records]
-        rejected_chat_records = [
-            self._build_chat_record(record, ChatMessage(role=record.answer_l.role, content=record.answer_l.content))
-            for record in records]
+        chosen_chat_records = [self._to_chat_record(r, r.answer_w) for r in records]
+        rejected_chat_records = [self._to_chat_record(r, r.answer_l) for r in records]
 
         tokenized_chosen = self._chat_dataset.convert_records(chosen_chat_records)
         tokenized_rejected = self._chat_dataset.convert_records(rejected_chat_records)
