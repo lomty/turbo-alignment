@@ -122,7 +122,10 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         loss = loss.detach()
         logits = tuple(v for k, v in logits_dict.items() if k not in ignore_keys)
         logits = nested_detach(logits)
-        logits = torch.stack(logits).mean(dim=2).T
+        logits = torch.stack(logits)
+        if logits.dim() == 3:
+            logits = logits.mean(dim=2)
+        logits = logits.T
 
         labels = logits[:, 0] > logits[:, 1]
 
