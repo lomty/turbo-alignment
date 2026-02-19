@@ -140,8 +140,10 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         batch_size, max_seq_len = batch['input_ids'].shape[:2]
         boundaries_tensor = torch.tensor(boundaries, dtype=torch.long, device=device)  # [batch_size, 3]
 
+        # TODO: For MagiAttention, we don't need the heavy 4D mask
         batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)
         batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
+        batch['boundaries'] = boundaries_tensor
 
         batch['chosen_indices'] = boundaries_tensor[:, 1] - 1
         batch['rejected_indices'] = boundaries_tensor[:, 2] - 1

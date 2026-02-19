@@ -182,8 +182,15 @@ class BaseTrainStrategy(S3Mixin, BaseStrategy, Generic[ExperimentSettingsT, Trai
             )
 
             data_collator = self._get_data_collator(experiment_settings, self.tokenizer)
-            if experiment_settings.trainer_settings.sequence_parallel > 1:
-                logger.info('Wrap data collator to support sequence parallelism')
+            
+            # Check if using MagiAttention backend
+            sp_backend = getattr(experiment_settings.trainer_settings, "sp_backend", "ulysses")
+            # TODO: revise later DataCollatorForSequenceParallism
+            if sp_backend == "magi_attention":
+                logger.info("Using MagiAttention backend - skipping DataCollatorForSequenceParallism wrapping")
+                # MagiAttention handles dispatch internally in the trainer
+            elif experiment_settings.trainer_settings.sequence_parallel > 1:
+                logger.info('Wrap data collator to support sequence parallelism (Ulysses)')
                 data_collator = DataCollatorForSequenceParallism.create_with_tokenizer(  # type: ignore[assignment]
                     data_collator,
                     seq_p_rank=get_sequence_parallel_rank(),

@@ -81,8 +81,8 @@ This maps directly to MagiAttention's `q_ranges/k_ranges/attn_type_map`:
 # 4 attention slices per sample:
 q_ranges = [[0, ctx_end],                    # context queries
             [ctx_end, chosen_end],            # chosen queries  
-            [chosen_end, rejected_end],       # rejected → context
-            [chosen_end, rejected_end]]       # rejected → self
+            [chosen_end, rejected_end],       # rejected -> context
+            [chosen_end, rejected_end]]       # rejected -> self
 k_ranges = [[0, ctx_end],                    # context attends to context
             [0, chosen_end],                  # chosen attends to context+chosen
             [0, ctx_end],                     # rejected attends to context
@@ -94,358 +94,41 @@ MagiAttention's FFA kernel processes these slices natively without materializing
 
 ---
 
-## 2. Detailed Codebase Changes
+## 2. Implementation Details
 
-### 2.1 Files to CREATE
+### 2.1 Files Created
 
-#### `turbo_alignment/modeling/magi_attn.py` (NEW — ~40 lines)
+#### `turbo_alignment/modeling/magi_attn.py`
+Registers the MagiAttention backend with HuggingFace Transformers. This allows any HF model to use MagiAttention by setting `config._attn_implementation = "magi_attention"`.
 
-Registers the MagiAttention backend with HuggingFace Transformers:
+#### `turbo_alignment/modeling/magi_mask_converter.py`
+Converts PairPreference boundaries (context/chosen/rejected lengths) into MagiAttention's `q_ranges`, `k_ranges`, and `attn_types`. This avoids creating the 1.15 GB dense mask.
 
-```python
-"""MagiAttention backend for HuggingFace Transformers.
+### 2.2 Files Modified
 
-Registers a custom attention function that delegates to MagiAttention's
-distributed calc_attn API. This replaces the Ulysses all_to_all approach
-with MagiAttention's dispatch/undispatch paradigm.
-"""
-import torch
-from einops import rearrange
-from torch import nn
-from typing import Optional
+#### `turbo_alignment/settings/tf/trainer.py`
+Added `sp_backend` field to `TrainerSettings`. Defaults to `"ulysses"`, can be set to `"magi_attention"`.
 
-from magi_attention.api import calc_attn, get_most_recent_key
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+#### `turbo_alignment/dataset/pair_preferences/collators.py`
+Modified `PairPreferenceDataCollator` to include `boundaries` in the batch. This tensor `[B, 3]` is lightweight and needed for MagiAttention dispatch.
 
+#### `turbo_alignment/trainers/rm.py`
+Modified `RMTrainer` to handle MagiAttention:
+- In `_prepare_inputs`: Checks for `sp_backend="magi_attention"`. (Currently placeholder for dispatch logic, as dispatch is complex and requires group handling).
+- In `compute_loss`: Implements the full dispatch -> model -> undispatch flow.
+  - Converts boundaries to Magi ranges.
+  - Calls `magi_attn_varlen_dispatch` to distribute tokens.
+  - Calls model with dispatched tokens (and no mask).
+  - Calls `undispatch` to gather hidden states.
+  - Computes loss using standard indexing (no `all_reduce` needed!).
 
-def magi_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,     # [batch=1, num_heads, seq_len, head_dim]
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    """
-    Drop-in attention function for HuggingFace's ALL_ATTENTION_FUNCTIONS registry.
-    
-    MagiAttention expects tensors in [total_seq, num_heads, head_dim] format.
-    The dispatch/undispatch is handled outside the model, so here we just
-    call calc_attn on the local (already dispatched) tokens.
-    """
-    magi_attn_key = get_most_recent_key()
-    dtype = query.dtype
-    
-    # HF format: [B, heads, seq, dim] → MagiAttn format: [seq, heads, dim]
-    q = rearrange(query, "1 nh s hd -> s nh hd").to(torch.bfloat16)
-    k = rearrange(key, "1 nh s hd -> s nh hd").to(torch.bfloat16)
-    v = rearrange(value, "1 nh s hd -> s nh hd").to(torch.bfloat16)
-    
-    o, meta = calc_attn(q, k, v, key=magi_attn_key)
-    
-    # Back to HF format: [seq, heads, dim] → [B=1, seq, heads*dim]
-    o = rearrange(o, "s nh hd -> 1 s (nh hd)").to(dtype)
-    return o, None
+#### `turbo_alignment/pipelines/train/base.py`
+Modified to skip wrapping the data collator with `DataCollatorForSequenceParallism` when `sp_backend="magi_attention"`. MagiAttention handles its own parallelism internally.
 
-
-ALL_ATTENTION_FUNCTIONS.register("magi_attention", magi_attention_forward)
-```
-
-#### `turbo_alignment/modeling/magi_mask_converter.py` (NEW — ~60 lines)
-
-Converts RM boundary format to MagiAttention's range format:
-
-```python
-"""Convert PairPreference boundaries to MagiAttention q_ranges/k_ranges.
-
-The RM training uses [context | chosen | rejected] sequential packing with
-a rectangular exclusion mask (rejected cannot attend to chosen).
-This module translates those boundaries into MagiAttention's compact
-q_ranges/k_ranges/attn_type_map representation.
-"""
-import torch
-from magi_attention.common import AttnRanges
-from magi_attention.common.enum import AttnMaskType
-
-
-def boundaries_to_magi_ranges(ctx_end: int, chosen_end: int, rejected_end: int):
-    """
-    Convert [context_end, chosen_end, rejected_end] boundaries to MagiAttention ranges.
-    
-    The RM attention pattern:
-      - Context [0, ctx_end): attends to context (FULL)
-      - Chosen [ctx_end, chosen_end): attends to context+chosen (CAUSAL)
-      - Rejected [chosen_end, rejected_end): attends to context (FULL) + self (CAUSAL)
-        but NOT to chosen (rectangular exclusion)
-    
-    Returns:
-        q_ranges: AttnRanges
-        k_ranges: AttnRanges  
-        attn_mask_types: list[AttnMaskType]
-    """
-    q_ranges_list = []
-    k_ranges_list = []
-    attn_types = []
-    
-    # Slice 1: Context queries → Context keys (FULL bidirectional)
-    q_ranges_list.append([0, ctx_end])
-    k_ranges_list.append([0, ctx_end])
-    attn_types.append(AttnMaskType.FULL)
-    
-    # Slice 2: Chosen queries → Context+Chosen keys (CAUSAL)
-    q_ranges_list.append([ctx_end, chosen_end])
-    k_ranges_list.append([0, chosen_end])
-    attn_types.append(AttnMaskType.CAUSAL)
-    
-    # Slice 3: Rejected queries → Context keys (FULL — rejected can see all context)
-    q_ranges_list.append([chosen_end, rejected_end])
-    k_ranges_list.append([0, ctx_end])
-    attn_types.append(AttnMaskType.FULL)
-    
-    # Slice 4: Rejected queries → Rejected keys (CAUSAL — rejected attends to self)
-    q_ranges_list.append([chosen_end, rejected_end])
-    k_ranges_list.append([chosen_end, rejected_end])
-    attn_types.append(AttnMaskType.CAUSAL)
-    
-    q_ranges = AttnRanges.from_ranges(q_ranges_list)
-    k_ranges = AttnRanges.from_ranges(k_ranges_list)
-    
-    return q_ranges, k_ranges, attn_types
-
-
-def batch_boundaries_to_cu_seqlens(boundaries_tensor: torch.Tensor, max_seq_len: int):
-    """
-    Convert batch of boundaries to cu_seqlens format for varlen dispatch.
-    boundaries_tensor: [batch_size, 3] — (ctx_end, chosen_end, rejected_end)
-    """
-    batch_size = boundaries_tensor.shape[0]
-    # Each sample occupies rejected_end tokens
-    seqlens = boundaries_tensor[:, 2]  # rejected_end = total length per sample
-    cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32)
-    cu_seqlens[1:] = torch.cumsum(seqlens, dim=0)
-    return cu_seqlens, cu_seqlens.clone()  # q and k have same lengths
-```
-
-### 2.2 Files to MODIFY
-
-#### `turbo_alignment/trainers/rm.py` — Major Changes
-
-**Current state**: `RMTrainer.compute_loss()` does:
-1. Manually calls `model.model(...)` to get hidden_states
-2. Calls `model.score(hidden_states)` on ALL positions
-3. Has SP-aware reward extraction with `all_reduce` for distributed indices
-4. The `prediction_step` has the dimension bug that caused the original crash
-
-**With MagiAttention**: 
-- Dispatch happens in `_prepare_inputs` (before `compute_loss`)
-- Undispatch happens after model forward (in `compute_loss`)
-- Reward extraction becomes simple indexing (no SP-aware logic needed)
-- The model is called normally — no manual `model.model(...)` + `model.score(...)` split needed
-
-Specific changes to `compute_loss`:
-
-```python
-# CURRENT (with Ulysses SP):
-def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-    # Manual forward through model internals
-    hidden_states = model.model(input_ids=..., attention_mask=..., position_ids=...).last_hidden_state
-    logits = model.score(hidden_states)
-    
-    # SP-aware reward extraction — complex, error-prone
-    if parallel_states.sequence_parallel_is_initialized():
-        rank = parallel_states.get_sequence_parallel_rank()
-        seq_len_chunk = logits.size(1)
-        offset = rank * seq_len_chunk
-        def get_rewards(indices):
-            is_local = (indices >= offset) & (indices < offset + seq_len_chunk)
-            local_indices = indices - offset
-            safe_indices = torch.where(is_local, local_indices, torch.zeros_like(local_indices))
-            rewards = logits[batch_idx, safe_indices].squeeze(-1)
-            rewards = rewards * is_local.to(rewards.dtype)
-            dist.all_reduce(rewards, op=dist.ReduceOp.SUM, group=parallel_states.get_sequence_parallel_group())
-            return rewards
-        rewards_w = get_rewards(chosen_indices)
-        rewards_l = get_rewards(rejected_indices)
-    else:
-        rewards_w = logits[batch_idx, chosen_indices]
-        rewards_l = logits[batch_idx, rejected_indices]
-
-# WITH MAGIATTENTION:
-def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-    from magi_attention.api import get_most_recent_key, undispatch
-    
-    # Standard model forward (model uses registered magi_attention backend internally)
-    outputs = model(input_ids=inputs['input_ids'], 
-                    attention_mask=None,  # No 4D mask needed!
-                    position_ids=inputs['position_ids'])
-    hidden_states = outputs.last_hidden_state
-    
-    # Undispatch: gather tokens back to global order
-    magi_key = get_most_recent_key()
-    if magi_key is not None:
-        hidden_states = undispatch(hidden_states.squeeze(0), magi_key).unsqueeze(0)
-    
-    logits = model.score(hidden_states)
-    
-    # Simple indexing — works because undispatch restored global order
-    batch_size = inputs['input_ids'].shape[0]
-    rewards_w = logits[torch.arange(batch_size), inputs['chosen_indices']]
-    rewards_l = logits[torch.arange(batch_size), inputs['rejected_indices']]
-    
-    loss = -torch.nn.functional.logsigmoid(rewards_w - rewards_l).mean()
-```
-
-The SP-aware `get_rewards` function with `is_local` masking and `all_reduce` (20+ lines) is replaced by 2 lines of direct indexing.
-
-#### `turbo_alignment/dataset/pair_preferences/collators.py` — Medium Changes
-
-**Current state**: `PairPreferenceDataCollator.__call__()` produces:
-- `input_ids`: padded sequences
-- `attention_mask`: **4D mask** `[B, 1, S, S]` (1.15 GB at 24K)
-- `position_ids`: symmetric positions
-- `chosen_indices`, `rejected_indices`
-
-**With MagiAttention**:
-- `input_ids`: same as before
-- `attention_mask`: **removed** — MagiAttention uses q_ranges/k_ranges instead
-- `boundaries`: `[B, 3]` tensor of (ctx_end, chosen_end, rejected_end) — used for dispatch
-- `position_ids`: still needed for symmetric positioning (computed before dispatch)
-- `chosen_indices`, `rejected_indices`: same as before
-
-The `_get_attn_mask()` method (which builds the expensive `[S, S]` causal mask with rectangular exclusion) can be **completely removed** when using MagiAttention. The `_get_position_ids()` method is still needed.
-
-The `__call__` method changes:
-
-```python
-# CURRENT:
-batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)  # 1.15 GB
-batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
-
-# WITH MAGIATTENTION:
-batch['boundaries'] = boundaries_tensor  # [B, 3] — ~24 bytes
-batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
-# No attention_mask — saves 1.15 GB per sample
-```
-
-#### `turbo_alignment/modeling/qwen3.py` — Can Be Largely Removed
-
-**Current state**: 500+ lines of forked Qwen3 code. The key modifications are:
-1. `Qwen3Attention.forward()`: Injects `_SeqAllToAll` calls (lines 99-115 in the class)
-2. `Qwen3ModelWithMPU._update_causal_mask()`: SP-adjusted sequence lengths
-3. `Qwen3ModelWithMPU.forward()`: SP position ID handling
-4. `Qwen3ForSequenceClassificationWithMPU`: `GatherAllLogits.apply()` calls
-
-**With MagiAttention**: 
-- `Qwen3Attention` can use the **standard HuggingFace implementation** — no `_SeqAllToAll` needed. The attention is handled by the registered `magi_attention` backend via `ALL_ATTENTION_FUNCTIONS`.
-- `_update_causal_mask()` override can be removed — MagiAttention doesn't use 4D masks
-- `GatherAllLogits.apply()` in the SequenceClassification model is replaced by `undispatch()` in the trainer
-
-The entire `qwen3.py` could be replaced by using `AutoModelForSequenceClassification` with:
-```python
-model.config._attn_implementation = "magi_attention"
-```
-
-However, to maintain backward compatibility, the file should keep a simplified version without Ulysses-specific code, or add a config flag to choose the backend.
-
-#### `turbo_alignment/modeling/parallel_states.py` — Replaced by MagiAttention's Groups
-
-**Current state**: 500+ lines managing global process groups:
-- `_SEQUENCE_PARALLEL_GROUP`
-- `_SEQUENCE_DATA_PARALLEL_GROUP`  
-- `_DATA_PARALLEL_GROUP`
-- Complex `initialize_model_parallel()` that creates DP×SP mesh
-
-**With MagiAttention**: Process groups are created via PyTorch's `DeviceMesh`:
-
-```python
-# MagiAttention's approach (from magi_trainer.py):
-device_mesh = DeviceMesh(
-    device_type="cuda",
-    mesh=torch.arange(0, world_size).reshape(world_size // cp_size, cp_size),
-    mesh_dim_names=("dp", "cp"),
-)
-cp_group = device_mesh.get_group("cp")
-```
-
-The `parallel_states.py` module can be kept for backward compatibility but MagiAttention's CP group is passed directly to `magi_attn_varlen_dispatch()`.
-
-#### `turbo_alignment/sequence_parallel/collator.py` — No Longer Needed for MagiAttention
-
-**Current state**: `DataCollatorForSequenceParallism` wraps the base collator to split batches across SP ranks:
-
-```python
-# In pipelines/train/base.py:
-if experiment_settings.trainer_settings.sequence_parallel > 1:
-    data_collator = DataCollatorForSequenceParallism.create_with_tokenizer(
-        data_collator,
-        seq_p_rank=get_sequence_parallel_rank(),
-        seq_p_world_size=get_sequence_parallel_world_size(),
-        tokenizer=self.tokenizer,
-        fields_not_to_split=['attention_mask', 'chosen_indices', 'rejected_indices'],
-    )
-```
-
-**With MagiAttention**: This wrapper is not needed. MagiAttention's dispatch handles token distribution. The collator produces full sequences, and the trainer dispatches them before the model forward pass.
-
-#### `turbo_alignment/sequence_parallel/trainer.py` — Simplified
-
-**Current state**: Custom `_inner_training_loop` with SP-aware batch size calculations, gradient scaling, etc.
-
-**With MagiAttention**: The trainer only needs:
-1. Dispatch in `_prepare_inputs`
-2. Undispatch in `compute_loss`
-3. Loss scaling by CP size in backward (as shown in MagiAttention's `magi_trainer.py`)
-
-Most of the complex SP logic in `trainer.py` becomes unnecessary.
-
-#### `turbo_alignment/pipelines/train/base.py` — Minor Changes
-
-Remove the `DataCollatorForSequenceParallism` wrapping when using MagiAttention:
-
-```python
-# CURRENT:
-if experiment_settings.trainer_settings.sequence_parallel > 1:
-    data_collator = DataCollatorForSequenceParallism.create_with_tokenizer(...)
-
-# WITH MAGIATTENTION:
-if experiment_settings.trainer_settings.sp_backend == "magi_attention":
-    pass  # No wrapping needed
-elif experiment_settings.trainer_settings.sequence_parallel > 1:
-    data_collator = DataCollatorForSequenceParallism.create_with_tokenizer(...)
-```
-
-#### `turbo_alignment/settings/model.py` — Add MagiAttention Config
-
-```python
-class ModelType(str, Enum):
-    CAUSAL = 'causal'
-    SEQ_CLS = 'seq_cls'
-    # ... existing types ...
-    SEQ_CLS_QWEN3_WITH_ULYSSES = 'seq_cls_qwen3_with_ulysses'
-    # NEW: MagiAttention doesn't need a separate model type — 
-    # it uses standard seq_cls with a registered attention backend
-```
-
-#### `turbo_alignment/settings/tf/trainer.py` — Add SP Backend Choice
-
-```python
-class TrainerSettings(BaseModel):
-    sequence_parallel: int = 1
-    sp_backend: str = "ulysses"  # NEW: "ulysses" | "magi_attention"
-```
-
-### 2.3 Files UNCHANGED
-
-These files don't need modification:
-- `turbo_alignment/dataset/pair_preferences/pair_preference.py` — Dataset reading/tokenization is unaffected
-- `turbo_alignment/dataset/chat/chat.py` — Chat tokenization is unaffected
-- `turbo_alignment/metrics/reward.py` — Metrics computation works on gathered outputs
-- `turbo_alignment/modeling/ulysses_attn.py` — Kept as fallback for non-Hopper GPUs
+#### `turbo_alignment/sequence_parallel/trainer.py`
+Modified `TrainerWithSeqP` to correctly calculate effective batch size when using MagiAttention. It uses `args.sequence_parallel` as the CP size instead of relying on Ulysses `parallel_states`.
 
 ---
-
 ## 3. Data Flow Comparison
 
 ### 3.1 Current Flow (Ulysses SP)
@@ -538,24 +221,17 @@ The RM uses symmetric position IDs (rejected mirrors chosen). MagiAttention's `g
 
 ---
 
-## 5. Implementation Plan
+-   **Hardware**: Requires NVIDIA Hopper GPUs (H100/H200).
+-   **Model Support**: Works with any HF model that supports `_attn_implementation` config (e.g., Qwen2, Llama3).
+-   **Batch Size**: Effective batch size calculation assumes `sequence_parallel` parameter reflects the Context Parallel size.
 
-| Phase | Task | Files | Effort | Risk |
-|---|---|---|---|---|
-| **1** | Create `magi_attn.py` attention backend | NEW file | 1 day | Low |
-| **2** | Create `magi_mask_converter.py` | NEW file | 1 day | Medium |
-| **3** | Add `sp_backend` config option | `settings/tf/trainer.py`, `settings/model.py` | 0.5 day | Low |
-| **4** | Modify collator to skip 4D mask when using MagiAttention | `collators.py` | 0.5 day | Low |
-| **5** | Create `MagiRMTrainer` with dispatch/undispatch/simplified compute_loss | `trainers/rm.py` or NEW file | 2 days | Medium |
-| **6** | Skip `DataCollatorForSequenceParallism` wrapping | `pipelines/train/base.py` | 0.5 day | Low |
-| **7** | Integration test on H100 cluster | Test configs | 2-3 days | Medium |
+## 5. Usage
 
-**Total: 7-9 days** including testing.
+To use MagiAttention for RM training:
 
-### Dependencies
-- `magi_attention` package (pip install from source, requires NGC docker)
-- `einops` (for tensor reshaping in attention function)
-- Hopper GPU cluster access for testing
-
-### Backward Compatibility
-All changes are additive. The `sp_backend: "ulysses"` default preserves existing behavior. MagiAttention is opt-in via `sp_backend: "magi_attention"`.
+1.  **Install MagiAttention**: Ensure `magi_attention` is installed in your environment (requires Hopper GPUs).
+2.  **Configure Training**: Set `sp_backend: "magi_attention"` in your trainer configuration yaml/json.
+3.  **Run**:
+    ```bash
+    accelerate launch ... --sp_backend magi_attention ...
+    ```
