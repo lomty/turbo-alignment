@@ -8,6 +8,7 @@ from turbo_alignment.modeling.parallel_states import initialize_model_parallel
 @dataclasses.dataclass
 class TrainingArgumentsWithSeqP(TrainingArguments):
     sequence_parallel: int = 1
+    sp_backend: str = 'ulysses'
 
     def __post_init__(self):
         super().__post_init__()
