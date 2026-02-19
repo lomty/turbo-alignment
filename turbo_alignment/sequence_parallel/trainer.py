@@ -146,10 +146,14 @@ class TrainerWithSeqP(Trainer):
         # total number of training steps to execute: max_steps
 
         # BEGIN OF PATCH
+        sp_world_size = parallel_states.get_sequence_parallel_world_size_or_one()
+        if getattr(args, "sp_backend", "ulysses") == "magi_attention":
+            sp_world_size = getattr(args, "sequence_parallel", 1)
+
         total_train_batch_size = (
             self._train_batch_size
             * args.gradient_accumulation_steps
-            * (args.world_size // parallel_states.get_sequence_parallel_world_size_or_one())
+            * (args.world_size // sp_world_size)
         )
         # END OF PATCH
 
