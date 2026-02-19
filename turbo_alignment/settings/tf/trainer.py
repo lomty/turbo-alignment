@@ -52,3 +52,4 @@ class TrainerSettings(ExtraFieldsNotAllowedBaseModel):
     include_tokens_per_second: bool = False
     include_num_input_tokens_seen: bool = False
     sequence_parallel: int = 1
+    sp_backend: str = "ulysses"
