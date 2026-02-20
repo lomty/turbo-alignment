@@ -154,10 +154,10 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                 length = boundaries[i, 2].item()
                 # q_ranges_list[i] is an AttnRanges object
                 # We need to extract its ranges and add offset
-                for r in q_ranges_list[i].ranges:
-                    combined_q_ranges.append([r[0] + offset, r[1] + offset])
-                for r in k_ranges_list[i].ranges:
-                    combined_k_ranges.append([r[0] + offset, r[1] + offset])
+                for r in q_ranges_list[i]:
+                    combined_q_ranges.append([r.start + offset, r.end + offset])
+                for r in k_ranges_list[i]:
+                    combined_k_ranges.append([r.start + offset, r.end + offset])
                 combined_attn_types.extend(attn_types_list[i])
                 
                 offset += length
