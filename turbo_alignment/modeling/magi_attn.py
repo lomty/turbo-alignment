@@ -9,14 +9,13 @@ from einops import rearrange
 from torch import nn
 from typing import Optional
 
-try:
-    from magi_attention.api import calc_attn, get_most_recent_key
-except ImportError:
-    calc_attn = None
-    get_most_recent_key = None
-
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.utils import logging
+
+from magi_attention.api import calc_attn, get_most_recent_key
+from magi_attention.common import AttnRanges
+from magi_attention.common.enum import AttnMaskType
+
 
 logger = logging.get_logger(__name__)
 
@@ -51,10 +50,8 @@ def magi_attention_forward(
     v = rearrange(value, "b nh s hd -> (b s) nh hd").to(torch.bfloat16)
     
     o, meta = calc_attn(q, k, v, key=magi_attn_key)
-    
-    if torch.distributed.get_rank() == 0 and not hasattr(magi_attention_forward, "_logged"):
-        logger.info(f"MagiAttention forward pass executed. q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
-        magi_attention_forward._logged = True
+
+    logger.info(f"MagiAttention forward pass executed. q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
 
     # Back to HF format: [seq, heads, dim] -> [B=1, seq, heads*dim]
     # We reshape to match input batch dimension, though usually it's 1 after dispatch
@@ -63,5 +60,51 @@ def magi_attention_forward(
     
     return o, None
 
+def boundaries_to_magi_ranges(ctx_end: int, chosen_end: int, rejected_end: int):
+    """
+    Convert [context_end, chosen_end, rejected_end] boundaries to MagiAttention ranges.
+
+    The RM attention pattern:
+      - Context [0, ctx_end): attends to context (FULL)
+      - Chosen [ctx_end, chosen_end): attends to context+chosen (CAUSAL)
+      - Rejected [chosen_end, rejected_end): attends to context (FULL) + self (CAUSAL)
+        but NOT to chosen (rectangular exclusion)
+
+    Returns:
+        q_ranges: AttnRanges
+        k_ranges: AttnRanges
+        attn_mask_types: list[AttnMaskType]
+    """
+    if AttnRanges is None:
+        raise ImportError("MagiAttention is not installed.")
+
+    q_ranges_list = []
+    k_ranges_list = []
+    attn_types = []
+
+    # Slice 1: Context queries -> Context keys (FULL bidirectional)
+    q_ranges_list.append([0, ctx_end])
+    k_ranges_list.append([0, ctx_end])
+    attn_types.append(AttnMaskType.FULL)
+
+    # Slice 2: Chosen queries -> Context+Chosen keys (CAUSAL)
+    q_ranges_list.append([ctx_end, chosen_end])
+    k_ranges_list.append([0, chosen_end])
+    attn_types.append(AttnMaskType.CAUSAL)
+
+    # Slice 3: Rejected queries -> Context keys (FULL - rejected can see all context)
+    q_ranges_list.append([chosen_end, rejected_end])
+    k_ranges_list.append([0, ctx_end])
+    attn_types.append(AttnMaskType.FULL)
+
+    # Slice 4: Rejected queries -> Rejected keys (CAUSAL - rejected attends to self)
+    q_ranges_list.append([chosen_end, rejected_end])
+    k_ranges_list.append([chosen_end, rejected_end])
+    attn_types.append(AttnMaskType.CAUSAL)
+
+    q_ranges = AttnRanges.from_ranges(q_ranges_list)
+    k_ranges = AttnRanges.from_ranges(k_ranges_list)
+
+    return q_ranges, k_ranges, attn_types
 
 ALL_ATTENTION_FUNCTIONS.register("magi_attention", magi_attention_forward)
