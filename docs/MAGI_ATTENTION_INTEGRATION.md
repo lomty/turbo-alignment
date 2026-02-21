@@ -235,3 +235,8 @@ To use MagiAttention for RM training:
     ```bash
     accelerate launch ... --sp_backend magi_attention ...
     ```
+
+## 6. Future Work
+
+- **TODO**: Override `model_type` and `_attn_implementation` automatically based on `sp_backend`.
+  Currently, users must manually ensure they are using the correct model type (e.g., `seq_cls` instead of `seq_cls_qwen3_with_ulysses`) when `sp_backend="magi_attention"`. In the future, the trainer or model loader should automatically select the appropriate model class and set `_attn_implementation="magi_attention"` when the backend is enabled, preventing configuration mismatches.
