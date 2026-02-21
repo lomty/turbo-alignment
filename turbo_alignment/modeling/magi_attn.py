@@ -37,9 +37,6 @@ def magi_attention_forward(
     The dispatch/undispatch is handled outside the model, so here we just
     call calc_attn on the local (already dispatched) tokens.
     """
-    if calc_attn is None:
-        raise ImportError("MagiAttention is not installed. Please install it to use magi_attention backend.")
-
     magi_attn_key = get_most_recent_key()
     dtype = query.dtype
     
@@ -51,8 +48,9 @@ def magi_attention_forward(
     
     o, meta = calc_attn(q, k, v, key=magi_attn_key)
 
-    logger.info(f"MagiAttention forward pass executed. q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
-
+    if torch.distributed.get_rank() == 0 and not hasattr(magi_attention_forward, "_logged"):
+        logger.info(f"MagiAttention forward pass executed. q shape: {q.shape}, k shape: {k.shape}, v shape: {v.shape}")
+        magi_attention_forward._logged = True
     # Back to HF format: [seq, heads, dim] -> [B=1, seq, heads*dim]
     # We reshape to match input batch dimension, though usually it's 1 after dispatch
     batch_size = query.shape[0]
