@@ -13,9 +13,13 @@ SP is a memory optimization, not a speed optimization. Every increase in SP degr
 - OOM with SP=2, fits with SP=4? → Use **SP=4**
 - And so on...
 
-## Background: How Ulysses Sequence Parallelism Works
+**Note on Backends**: This guide covers both **Ulysses** (default) and **MagiAttention** backends.
+- **Ulysses**: Works on any GPU, requires `*_with_ulysses` model types.
+- **MagiAttention**: Requires Hopper GPUs (H100/H200), uses stock model types (`seq_cls`, `causal`), handles complex masks efficiently.
 
-This codebase implements [Ulysses-style](https://arxiv.org/abs/2309.14509) sequence parallelism. When `sequence_parallel = SP` is set in trainer settings:
+## Background: How Ulysses SP Works (default backend)
+
+This codebase implements [Ulysses-style] sequence parallelism. When `sequence_parallel = SP` is set in trainer settings (with `sp_backend="ulysses"`):
 
 1. **GPU grouping**: The total `world_size` GPUs are divided into SP groups of `SP` GPUs each. The remaining dimension becomes data parallelism (DP):
    ```
@@ -29,6 +33,8 @@ This codebase implements [Ulysses-style](https://arxiv.org/abs/2309.14509) seque
    - After attention: scatter along sequence, gather along heads → back to the original partitioning
 
 4. **Gradient synchronization**: Standard DP gradient all-reduce happens across the `DP = world_size / SP` replicas.
+
+For an alternative backend, see the **MagiAttention** section below.
 
 ## Why Higher SP Hurts Throughput
 
@@ -64,6 +70,8 @@ With fixed batch size `B` and sequence length `S`:
 
 The "saved" compute is not free — it is replaced by communication overhead. With modern optimized attention kernels (flash attention), the compute savings are small relative to the communication cost.
 
+> **MagiAttention note**: The communication overhead profile is different for MagiAttention. Instead of 4L all-to-all operations, MagiAttention performs 1 dispatch + per-layer GroupCast/GroupReduce (overlapped with compute) + 1 undispatch. Higher SP may be less costly with MagiAttention compared to Ulysses, though the general principle still holds: use the minimum SP that fits in memory.
+
 ## SP Group Placement and Node Topology
 
 ### Keep SP groups within a single node
@@ -92,35 +100,43 @@ When SP groups fit within a single node, adding more nodes increases only DP deg
 
 Since SP all_to_all stays intra-node in all cases, adding nodes primarily adds DP gradient all-reduce overhead (which scales well with InfiniBand). **More nodes ≈ proportionally faster training.**
 
-## Ulysses-Specific Constraints
+## Backend-Specific Constraints
+
+### Ulysses Constraints (default)
 
 - **Head divisibility**: `num_attention_heads` must be divisible by `SP`. For Qwen3-32B (64 heads), valid SP values are: 1, 2, 4, 8, 16, 32, 64.
 - **Attention mask memory**: The 4D attention mask `[batch, 1, seq_len, seq_len]` is NOT split across SP ranks — every GPU in the SP group stores the full mask. This means the O(seq_len²) mask memory is not reduced by SP.
 - **Sequence padding**: Sequences are padded to be divisible by SP. Small SP values waste less on padding.
 
+### MagiAttention Constraints
+
+- **No head divisibility requirement**: MagiAttention does not scatter across heads, so any SP value is valid (as long as it fits in memory).
+- **No 4D attention mask**: Uses compact `q_ranges/k_ranges` descriptors (~100 bytes vs 1.15 GB for dense mask).
+- **Hopper-only**: Requires NVIDIA H100/H200 GPUs.
+- **Must use stock model types**: Use `seq_cls` or `causal` (NOT `*_with_ulysses`). Using Ulysses model types with MagiAttention causes double communication (Ulysses all-to-all + MagiAttention GroupCast), resulting in assertion errors.
+- **Batch size 1**: MagiAttention squashes the batch dimension; `per_device_train_batch_size: 1` is required.
+- **`_attn_implementation`**: Automatically set to `"magi_attention"` by `RMTrainer` when `sp_backend="magi_attention"`.
+
 ## Configuration
 
-The `sequence_parallel` parameter lives inside `trainer_settings` (default: `1`, i.e. disabled). When SP > 1, you **must** use a model type with Ulysses attention support.
+The `sequence_parallel` parameter lives inside `trainer_settings` (default: `1`, i.e. disabled). The backend is selected via `sp_backend` (default: `"ulysses"`).
 
-### Available model types with Ulysses SP
+### Available model types
 
-| Model type string               | Base model  | Task                    |
-|----------------------------------|-------------|-------------------------|
-| `qwen3_with_ulysses`            | Qwen3       | Causal LM (SFT/DPO)    |
-| `seq_cls_qwen3_with_ulysses`    | Qwen3       | Sequence Classification (RM) |
-| `qwen_with_ulysses`             | Qwen2       | Causal LM               |
-| `seq_cls_qwen_with_ulysses`     | Qwen2       | Sequence Classification  |
-| `gemma_with_ulysses`            | Gemma2      | Causal LM               |
-| `seq_cls_gemma_with_ulysses`    | Gemma2      | Sequence Classification  |
+| Backend | Model type (RM) | Model type (SFT/DPO) |
+|---|---|---|
+| Ulysses | `seq_cls_qwen3_with_ulysses` | `qwen3_with_ulysses` |
+| MagiAttention | `seq_cls` | `causal` |
 
-Standard model types (`causal`, `seq_cls`) do **not** support SP and must be used with `sequence_parallel: 1`.
+Standard model types (`causal`, `seq_cls`) do **not** support Ulysses SP and must be used with `sequence_parallel: 1` (or MagiAttention).
 
-### Example config (RM training with Qwen3-32B, SP=4)
+### Example config (RM training with Qwen3-32B, SP=4, Ulysses)
 
 ```json
 {
   "trainer_settings": {
     "sequence_parallel": 4,
+    "sp_backend": "ulysses",
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 1,
     "deepspeed": "deepspeed_configs/stage2.json",
@@ -142,12 +158,41 @@ Standard model types (`causal`, `seq_cls`) do **not** support SP and must be use
 }
 ```
 
-> **Note**: Using a `*_with_ulysses` model type with `sequence_parallel: 1` also works — the Ulysses attention layers simply skip the all_to_all calls when SP is not initialized. However, there is no benefit to using the Ulysses model type without SP > 1.
+### Example config (RM training with Qwen3-32B, SP=4, MagiAttention)
+
+```json
+{
+  "trainer_settings": {
+    "sequence_parallel": 4,
+    "sp_backend": "magi_attention",
+    "per_device_train_batch_size": 1,
+    "deepspeed": "deepspeed_configs/stage2.json",
+    "bf16": true,
+    ...
+  },
+  "model_settings": {
+    "model_path": "/path/to/Qwen3-32B",
+    "model_type": "seq_cls",
+    "model_kwargs": { "num_labels": 1 }
+  }
+}
+```
+
+> ⚠️ **Warning**: Do NOT use `*_with_ulysses` model types with `sp_backend: "magi_attention"`. The Ulysses model variants inject all-to-all communication in every attention layer. MagiAttention handles its own distributed communication. Combining both causes a 2× sequence length mismatch assertion error.
 
 ## Decision Flowchart
 
 ```
 Start
+  │
+  ▼
+Do you have Hopper GPUs (H100/H200)?
+  ├── Yes → Consider sp_backend: "magi_attention"
+  │         (better for complex masks, no head constraints)
+  │         Use model_type: "seq_cls" or "causal"
+  │
+  ├── No → Use sp_backend: "ulysses" (default)
+  │         Use model_type: "*_with_ulysses"
   │
   ▼
 Does training fit in memory with SP=1?
@@ -166,19 +211,20 @@ Does training fit in memory with SP=1?
   │     │     ├── Yes → Use SP=4
   │     │     │
   │     │     ├── No → Continue increasing SP...
-  │     │     │        (ensure num_heads % SP == 0)
+  │     │     │        (ensure num_heads % SP == 0 for Ulysses)
   │     │     │        (ensure SP ≤ GPUs per node)
 ```
 
 ## Summary Table
 
-| Factor                        | SP=1       | SP=2        | SP=4        | SP=8        |
-|-------------------------------|------------|-------------|-------------|-------------|
-| SP communication overhead     | None       | Low         | Moderate    | High        |
-| DP degree (N GPUs)            | N          | N/2         | N/4         | N/8         |
-| Per-GPU sequence memory       | Full       | 1/2         | 1/4         | 1/8         |
-| Attention mask memory         | Full       | Full        | Full        | Full        |
-| Max supported sequence length | 1× base    | 2× base     | 4× base     | 8× base     |
-| Throughput (samples/sec)      | Highest    | High        | Moderate    | Lower       |
+| Factor                        | Ulysses SP=1 | Ulysses SP=4 | Magi SP=1 | Magi SP=4 |
+|-------------------------------|--------------|--------------|-----------|-----------|
+| SP communication overhead     | None         | Moderate (4L) | None      | Low (GroupCast) |
+| DP degree (N GPUs)            | N            | N/4          | N         | N/4       |
+| Per-GPU sequence memory       | Full         | 1/4          | Full      | 1/4       |
+| Attention mask memory         | Full (O(S²)) | Full (O(S²)) | ~100 bytes| ~100 bytes|
+| Head divisibility             | N/A          | Required     | N/A       | Not required |
+| Model type                    | `*_with_ulysses` | `*_with_ulysses` | `seq_cls` | `seq_cls` |
+| Hardware                      | Any          | Any          | Hopper    | Hopper    |
 
-**Bottom line**: SP is a knob for trading throughput for the ability to handle longer sequences. Always use the minimum SP that fits in memory.
+**Bottom line**: SP is a knob for trading throughput for the ability to handle longer sequences. Always use the minimum SP that fits in memory. If you have Hopper GPUs and complex attention patterns (e.g., RM training), MagiAttention is recommended as it eliminates the dense mask and reduces communication overhead.
