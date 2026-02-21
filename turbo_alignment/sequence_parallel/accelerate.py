@@ -317,9 +317,9 @@ class HfTrainerDeepSpeedSeqPConfig(HfTrainerDeepSpeedConfig):
         # train_batch_size = world_size * train_micro_batch_size_per_gpu * gradient_accumulation_steps
         # train_batch_size = args.world_size * args.per_device_train_batch_size * args.gradient_accumulation_steps
         train_batch_size = (
-            (args.world_size // getattr(args, 'sequence_parallel', 1))
-            * args.per_device_train_batch_size
-            * args.gradient_accumulation_steps
+                args.world_size
+                * args.per_device_train_batch_size
+                * args.gradient_accumulation_steps
         )
         self.fill_match(
             "train_micro_batch_size_per_gpu",
