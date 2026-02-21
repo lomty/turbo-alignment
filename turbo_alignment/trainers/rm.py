@@ -12,18 +12,28 @@ from transformers.trainer_pt_utils import nested_detach
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
-from magi_attention.api import (
-    get_most_recent_key,
-    undispatch,
-    magi_attn_flex_dispatch,
-    dispatch,
-    compute_pad_size,
-    squash_batch_dim,
-    get_position_ids
-)
-from magi_attention.config import DistAttnConfig
-from torch.distributed.device_mesh import DeviceMesh
-
+try:
+    from magi_attention.api import (
+        get_most_recent_key, 
+        undispatch, 
+        magi_attn_flex_dispatch, 
+        dispatch,
+        compute_pad_size,
+        squash_batch_dim,
+        get_position_ids
+    )
+    from magi_attention.config import DistAttnConfig
+    from torch.distributed.device_mesh import DeviceMesh
+except ImportError:
+    get_most_recent_key = None
+    undispatch = None
+    magi_attn_flex_dispatch = None
+    dispatch = None
+    compute_pad_size = None
+    squash_batch_dim = None
+    get_position_ids = None
+    DistAttnConfig = None
+    DeviceMesh = None
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
 from turbo_alignment.modeling import parallel_states
@@ -45,6 +55,17 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         - 'position_ids': Symmetric positions
         - 'chosen_indices', 'rejected_indices': Reward extraction positions
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if getattr(self.args, "sp_backend", "ulysses") == "magi_attention":
+            # Import magi_attn to register the backend
+            import turbo_alignment.modeling.magi_attn  # noqa: F401
+
+            # Force the model to use magi_attention backend
+            if hasattr(self.model, "config"):
+                self.model.config._attn_implementation = "magi_attention"
 
     def _build_cp_group(self):
         # cp_group do not change during training step.
