@@ -624,6 +624,13 @@ class AcceleratorWithSequenceParallelism(Accelerator):
                     )
 
             deepspeed_plugin.deepspeed_config_process(must_match=False, mismatches=[], **config_kwargs)
+            # fill_match with must_match=False does NOT override values already set
+            # (they were set by HfTrainerDeepSpeedSeqPConfig with raw world_size).
+            # We must explicitly overwrite them with the SP-adjusted values.
+            for key in ["train_batch_size", "train_micro_batch_size_per_gpu"]:
+                if key in config_kwargs:
+                    deepspeed_plugin.deepspeed_config[key] = config_kwargs[key]
+
             self.deepspeed_config = deepspeed_plugin.deepspeed_config
             kwargs = dict(model=model, config_params=self.deepspeed_config)
 
