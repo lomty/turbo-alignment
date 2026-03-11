@@ -68,21 +68,20 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
             core_model = core_model.base_model.model  # Unwrap PEFT
 
-        # Instead of using a hook (which breaks gradient checkpointing by smuggling tensors
-        # out of the forward pass), we ask the model to return hidden states.
-        # We then manually apply the score head to the last hidden state.
-        outputs = model(
+        # Note: We call the inner model directly to get BaseModelOutputWithPast with last_hidden_state,
+        # bypassing the SequenceClassifierOutputWithPast which would pool logits to last token only.
+        outputs = core_model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
-            output_hidden_states=True,
+            output_hidden_states=False,
             return_dict=True,
             **kwargs
         )
 
-        # Apply the score head to the last hidden state to get the full sequence of logits
-        last_hidden_state = outputs.hidden_states[-1]
+        # Get the last hidden state and apply the score head to get full sequence logits
+        last_hidden_state = outputs.last_hidden_state
         logits = core_model.score(last_hidden_state)  # [batch_size, seq_len, 1]
 
         # Extract rewards at segment boundaries from the sequentially packed sequence
