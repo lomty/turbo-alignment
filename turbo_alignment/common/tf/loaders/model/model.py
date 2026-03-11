@@ -33,11 +33,29 @@ def _load_pretrained_adapters(
     model: PreTrainedModel,
     model_settings: PreTrainedAdaptersModelSettings,
 ) -> PeftModel:
-    return PeftModel.from_pretrained(
+    peft_model = PeftModel.from_pretrained(
         model,
         model_settings.adapter_path,
         is_trainable=model_settings.is_trainable,
     )
+
+    # Check if a custom classification head was saved alongside the adapters
+    # This is needed for DeepSpeed Zero3 + PEFT training where the head is saved separately
+    cls_head_path = model_settings.adapter_path / 'cls_head' / 'cls_head.pt'
+    if cls_head_path.exists():
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f'Loading custom classification head from {cls_head_path}')
+
+        # The score head is in base_model.model for PEFT-wrapped models
+        if hasattr(peft_model, 'base_model') and hasattr(peft_model.base_model, 'model') and hasattr(peft_model.base_model.model, 'score'):
+            state_dict = torch.load(cls_head_path, map_location='cpu', weights_only=True)
+            peft_model.base_model.model.score.load_state_dict(state_dict)
+            logger.info('Successfully loaded custom classification head.')
+        else:
+            logger.warning("Found cls_head.pt but could not find the 'score' module in the model to load it into.")
+
+    return peft_model
 
 
 def unfreeze_params(layer):
