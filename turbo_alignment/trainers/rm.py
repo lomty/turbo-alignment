@@ -56,13 +56,20 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         model_dtype = next(model.parameters()).dtype
         attention_mask = torch.finfo(model_dtype).min * (attention_mask == 0).to(model_dtype)
 
-        hidden_states = model.model(
+        # Safely unwrap DeepSpeed and PEFT to get the core Hugging Face model
+        core_model = model
+        if hasattr(core_model, 'module'):
+            core_model = core_model.module  # Unwrap DeepSpeed
+        if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
+            core_model = core_model.base_model.model  # Unwrap PEFT
+
+        hidden_states = core_model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
         ).last_hidden_state
-        logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
+        logits = core_model.score(hidden_states)  # [batch_size, seq_len, 1]
 
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
