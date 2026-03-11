@@ -53,7 +53,8 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         attention_mask = inputs['attention_mask'].to(device)
         position_ids = inputs['position_ids'].to(device)
 
-        attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
+        model_dtype = next(model.parameters()).dtype
+        attention_mask = torch.finfo(model_dtype).min * (attention_mask == 0).to(model_dtype)
 
         hidden_states = model.model(
             input_ids=input_ids,
