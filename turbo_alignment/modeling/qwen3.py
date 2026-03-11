@@ -637,6 +637,7 @@ class Qwen3ForSequenceClassificationWithMPU(Qwen3PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
     ) -> SequenceClassifierOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -654,6 +655,7 @@ class Qwen3ForSequenceClassificationWithMPU(Qwen3PreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
         )
         hidden_states = transformer_outputs.last_hidden_state  # (bs, sequence_length // seq_p_degree, hidden_size)
         logits = self.score(hidden_states)  # (bs, sequence_length // seq_p_degree, self.num_labels)
