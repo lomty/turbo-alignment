@@ -63,29 +63,21 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
             core_model = core_model.base_model.model  # Unwrap PEFT
 
-        # 2. Use a forward hook to intercept the full sequence of logits from the score head.
-        # The model's forward method pools the logits, but we need the full sequence.
-        # A forward hook captures the output before pooling, without breaking DeepSpeed Zero3 or Gradient Checkpointing.
-        full_logits = []
+        # 2. Instead of using a hook (which breaks gradient checkpointing by smuggling tensors
+        # out of the forward pass), we ask the model to return hidden states.
+        # We then manually apply the score head to the last hidden state.
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-        def hook(module, input, output):
-            full_logits.append(output)
-
-        handle = core_model.score.register_forward_hook(hook)
-
-        try:
-            # Call the top-level model to ensure all DeepSpeed and Gradient Checkpointing hooks fire correctly
-            _ = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-        finally:
-            handle.remove()
-
-        # 3. The hook captured the output of the score head
-        logits = full_logits[0]  # [batch_size, seq_len, 1]
+        # 3. Apply the score head to the last hidden state to get the full sequence of logits
+        last_hidden_state = outputs.hidden_states[-1]
+        logits = core_model.score(last_hidden_state)  # [batch_size, seq_len, 1]
 
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
