@@ -315,8 +315,9 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
                 if isinstance(attention_mask, torch.Tensor)
                 else past_seen_tokens + sequence_length + 1
             )
-            # HACK
-            cache_position = torch.arange(0, sequence_length, device=input_tensor.device)
+            # Only generate cache_position if not provided (for backward compatibility)
+            if cache_position is None:
+                cache_position = torch.arange(0, sequence_length, device=input_tensor.device)
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
         causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
