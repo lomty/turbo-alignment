@@ -450,7 +450,7 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
 
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
-                    partial(decoder_layer.__call__, **flash_attn_kwargs),
+                    decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
                     position_ids,
@@ -459,6 +459,7 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    **flash_attn_kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
