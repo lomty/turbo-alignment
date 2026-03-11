@@ -63,30 +63,29 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
             core_model = core_model.base_model.model  # Unwrap PEFT
 
-        # 2. Temporarily replace the score head with an Identity layer to prevent double-computation
-        # and prevent it from breaking the autograd graph during the top-level forward pass.
-        # This ensures DeepSpeed Zero3 and Gradient Checkpointing hooks fire correctly.
-        original_score = core_model.score
-        core_model.score = nn.Identity()
+        # 2. Use a forward hook to intercept the full sequence of logits from the score head.
+        # The model's forward method pools the logits, but we need the full sequence.
+        # A forward hook captures the output before pooling, without breaking DeepSpeed Zero3 or Gradient Checkpointing.
+        full_logits = []
+
+        def hook(module, input, output):
+            full_logits.append(output)
+
+        handle = core_model.score.register_forward_hook(hook)
 
         try:
-            # Call the top-level model to ensure all DeepSpeed and PEFT hooks register correctly
-            outputs = model(
+            # Call the top-level model to ensure all DeepSpeed and Gradient Checkpointing hooks fire correctly
+            _ = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
-                output_hidden_states=True,
             )
         finally:
-            # Restore the original score head
-            core_model.score = original_score
+            handle.remove()
 
-        # 3. Get the unpooled hidden states from the last transformer layer
-        hidden_states = outputs.hidden_states[-1]
-
-        # 4. Manually compute the full sequence of logits using the restored score head
-        logits = core_model.score(hidden_states)  # [batch_size, seq_len, 1]
+        # 3. The hook captured the output of the score head
+        logits = full_logits[0]  # [batch_size, seq_len, 1]
 
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
