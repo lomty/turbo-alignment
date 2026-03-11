@@ -12,6 +12,11 @@ if tp.TYPE_CHECKING:
 logger = get_project_logger()
 
 
+# Counter for logging only first few batches
+_batch_counter = 0
+_MAX_LOG_BATCHES = 5
+
+
 # adapted from
 # https://github.com/InternLM/xtuner/blob/90192ffe42612b0f88409432e7b4860294432bcc/xtuner/parallel/sequence/data_collate.py#L7
 def pad_for_sequence_parallel(tensor, seq_parallel_world_size, padding_value, dim=-1, padding_side='right'):
@@ -113,6 +118,7 @@ class DataCollatorForSequenceParallism:
         return torch.arange(0, input_ids.shape[1], device=input_ids.device)
 
     def __call__(self, *args, **kwargs):
+        global _batch_counter
         collated = self.base_collate_fn(*args, **kwargs)
         if isinstance(collated, tp.Mapping):
             # Optionally add 'cache_position'. This is often needed for specific sequence parallel
@@ -120,13 +126,24 @@ class DataCollatorForSequenceParallism:
             if self.add_cache_positions:
                 cache_position = self._get_cache_position(collated['input_ids'])
                 collated['cache_position'] = cache_position
+                if _batch_counter < _MAX_LOG_BATCHES:
+                    logger.info(f"[Collator] Generated cache_position shape: {cache_position.shape}, dtype: {cache_position.dtype}")
 
             # The 'prepare_value' method is responsible for:
             # 1. Padding the tensor along the sequence dimension to be divisible by the world size.
             # 2. Splitting (chunking) the tensor along the sequence dimension.
             # 3. Returning ONLY the chunk corresponding to the current GPU rank.
             # This ensures that each GPU processes a unique, non-overlapping segment of the sequence.
-            return {key: self.prepare_value(key, value) for key, value in collated.items()}
+            result = {key: self.prepare_value(key, value) for key, value in collated.items()}
+            
+            if _batch_counter < _MAX_LOG_BATCHES:
+                logger.info(f"[Collator] Rank {self.seq_p_rank}/{self.seq_p_world_size} - "
+                           f"input_ids shape: {result.get('input_ids', 'N/A')}, "
+                           f"position_ids shape: {result.get('position_ids', 'N/A')}, "
+                           f"cache_position shape: {result.get('cache_position', 'N/A')}")
+                _batch_counter += 1
+            
+            return result
         else:
             return self._split_value(collated)
 

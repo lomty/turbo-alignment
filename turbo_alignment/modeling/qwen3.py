@@ -146,6 +146,11 @@ class Qwen3Attention(nn.Module):
         return attn_output, attn_weights
 
 
+# Counter for logging only first few forward passes
+_qwen3_forward_counter = 0
+_MAX_LOG_FORWARDS_QWEN3 = 10
+
+
 class Qwen3DecoderLayer(Qwen3DecoderLayerBase):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         nn.Module.__init__(self)
@@ -161,6 +166,43 @@ class Qwen3DecoderLayer(Qwen3DecoderLayerBase):
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
             )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        global _qwen3_forward_counter
+        if _qwen3_forward_counter < _MAX_LOG_FORWARDS_QWEN3:
+            logger.info(
+                f"[Qwen3DecoderLayer] hidden_states shape: {hidden_states.shape}, "
+                f"attention_mask shape: {attention_mask.shape if attention_mask is not None else 'None'}, "
+                f"position_ids shape: {position_ids.shape if position_ids is not None else 'None'}, "
+                f"cache_position shape: {cache_position.shape if cache_position is not None else 'None'}"
+            )
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                logger.info(f"[Qwen3DecoderLayer] cos shape: {cos.shape}, sin shape: {sin.shape}")
+            _qwen3_forward_counter += 1
+
+        return super().forward(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
 
 
 class Qwen3PreTrainedModel(PreTrainedModelWithMPU):
@@ -316,6 +358,15 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        # Debug logging at model entry
+        logger.info(
+            f"[Qwen3ModelWithMPU] ENTER forward - "
+            f"input_ids shape: {input_ids.shape if input_ids is not None else 'None'}, "
+            f"attention_mask shape: {attention_mask.shape if attention_mask is not None else 'None'}, "
+            f"position_ids shape: {position_ids.shape if position_ids is not None else 'None'}, "
+            f"cache_position shape: {cache_position.shape if cache_position is not None else 'None'}"
+        )
+
         if position_ids is None:
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
@@ -359,6 +410,13 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
             # HACK
             sequence_length = inputs_embeds.size(1) * parallel_states.get_sequence_parallel_world_size_or_one()
             cache_position = torch.arange(0, sequence_length, device=inputs_embeds.device)
+            logger.warning(
+                f"[Qwen3ModelWithMPU] cache_position was None, generated dynamically with shape: {cache_position.shape}, "
+                f"sequence_length: {sequence_length}, inputs_embeds.size(1): {inputs_embeds.size(1)}, "
+                f"seq_p_world_size: {parallel_states.get_sequence_parallel_world_size_or_one()}"
+            )
+        else:
+            logger.info(f"[Qwen3ModelWithMPU] cache_position provided with shape: {cache_position.shape}")
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
@@ -366,11 +424,20 @@ class Qwen3ModelWithMPU(Qwen3PreTrainedModel, Qwen3Model):
         causal_mask = self._update_causal_mask(
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
+        logger.info(
+            f"[Qwen3ModelWithMPU] causal_mask shape: {causal_mask.shape if causal_mask is not None else 'None'}, "
+            f"inputs_embeds shape: {inputs_embeds.shape}"
+        )
 
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        cos, sin = position_embeddings
+        logger.info(
+            f"[Qwen3ModelWithMPU] position_embeddings - cos shape: {cos.shape}, sin shape: {sin.shape}, "
+            f"position_ids shape: {position_ids.shape}"
+        )
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None

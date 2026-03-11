@@ -53,8 +53,22 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         attention_mask = inputs['attention_mask'].to(device)
         position_ids = inputs['position_ids'].to(device)
 
+        # Debug logging for tensor shapes
+        logger.info(f"[RMTrainer] input_ids shape: {input_ids.shape}, dtype: {input_ids.dtype}")
+        logger.info(f"[RMTrainer] attention_mask shape: {attention_mask.shape}, dtype: {attention_mask.dtype}")
+        logger.info(f"[RMTrainer] position_ids shape: {position_ids.shape}, dtype: {position_ids.dtype}")
+
         model_dtype = next(model.parameters()).dtype
         attention_mask = torch.finfo(model_dtype).min * (attention_mask == 0).to(model_dtype)
+
+        # Prepare kwargs with cache_position if available
+        kwargs = {}
+        if 'cache_position' in inputs:
+            cache_position = inputs['cache_position'].to(device)
+            kwargs['cache_position'] = cache_position
+            logger.info(f"[RMTrainer] cache_position shape: {cache_position.shape}, dtype: {cache_position.dtype}")
+        else:
+            logger.warning("[RMTrainer] cache_position NOT in inputs - model will generate it dynamically!")
 
         # 1. Safely unwrap DeepSpeed and PEFT to get access to the classification head (`score`)
         core_model = model
@@ -66,6 +80,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         # 2. Instead of using a hook (which breaks gradient checkpointing by smuggling tensors
         # out of the forward pass), we ask the model to return hidden states.
         # We then manually apply the score head to the last hidden state.
+        logger.info(f"[RMTrainer] Calling model with kwargs keys: {list(kwargs.keys())}")
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -73,11 +88,14 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             use_cache=False,
             output_hidden_states=True,
             return_dict=True,
+            **kwargs
         )
 
         # 3. Apply the score head to the last hidden state to get the full sequence of logits
         last_hidden_state = outputs.hidden_states[-1]
+        logger.info(f"[RMTrainer] last_hidden_state shape: {last_hidden_state.shape}")
         logits = core_model.score(last_hidden_state)  # [batch_size, seq_len, 1]
+
 
         # Extract rewards at segment boundaries from the sequentially packed sequence
         chosen_indices = inputs['chosen_indices'].to(device)
