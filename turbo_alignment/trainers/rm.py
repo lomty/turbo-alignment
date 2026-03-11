@@ -56,27 +56,36 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         model_dtype = next(model.parameters()).dtype
         attention_mask = torch.finfo(model_dtype).min * (attention_mask == 0).to(model_dtype)
 
-        # 1. Call the top-level model to ensure DeepSpeed Zero3 and Gradient Checkpointing hooks fire correctly.
-        # We request output_hidden_states=True to get the full sequence of hidden states before the classification head pools them.
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            output_hidden_states=True,
-        )
-
-        # outputs.hidden_states is a tuple of hidden states from all layers. The last one is what we need.
-        hidden_states = outputs.hidden_states[-1]
-
-        # 2. Safely unwrap DeepSpeed and PEFT to get access to the classification head (`score`)
+        # 1. Safely unwrap DeepSpeed and PEFT to get access to the classification head (`score`)
         core_model = model
         if hasattr(core_model, 'module'):
             core_model = core_model.module  # Unwrap DeepSpeed
         if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
             core_model = core_model.base_model.model  # Unwrap PEFT
 
-        # 3. Compute the full sequence of logits
+        # 2. Temporarily replace the score head with an Identity layer to prevent double-computation
+        # and prevent it from breaking the autograd graph during the top-level forward pass.
+        # This ensures DeepSpeed Zero3 and Gradient Checkpointing hooks fire correctly.
+        original_score = core_model.score
+        core_model.score = nn.Identity()
+
+        try:
+            # Call the top-level model to ensure all DeepSpeed and PEFT hooks register correctly
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                output_hidden_states=True,
+            )
+        finally:
+            # Restore the original score head
+            core_model.score = original_score
+
+        # 3. Get the unpooled hidden states from the last transformer layer
+        hidden_states = outputs.hidden_states[-1]
+
+        # 4. Manually compute the full sequence of logits using the restored score head
         logits = core_model.score(hidden_states)  # [batch_size, seq_len, 1]
 
         # Extract rewards at segment boundaries from the sequentially packed sequence
