@@ -61,6 +61,25 @@ if is_deepspeed_available():
 
 
 class PreTrainedModelWithMPU(PreTrainedModel):
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """Override to force use_reentrant=True when DeepSpeed Zero3 is enabled.
+
+        DeepSpeed Zero3 partitions weights across GPUs. With use_reentrant=False,
+        PyTorch's checkpoint recomputation doesn't trigger DeepSpeed's weight gathering
+        hooks, causing weights to remain at shape [0] during recomputation.
+        """
+        if is_deepspeed_zero3_enabled():
+            if gradient_checkpointing_kwargs is None:
+                gradient_checkpointing_kwargs = {}
+            if not gradient_checkpointing_kwargs.get('use_reentrant', True):
+                logger.warning(
+                    "DeepSpeed Zero3 detected: overriding use_reentrant=False to use_reentrant=True "
+                    "for gradient checkpointing compatibility. Zero3 weight gathering hooks are not "
+                    "triggered during non-reentrant checkpoint recomputation."
+                )
+                gradient_checkpointing_kwargs['use_reentrant'] = True
+        super().gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+
     @classmethod
     def get_init_context(cls, is_quantized: bool, _is_ds_init_called: bool):
         if is_deepspeed_zero3_enabled():
