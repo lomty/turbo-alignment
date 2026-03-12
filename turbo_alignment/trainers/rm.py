@@ -3,7 +3,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from peft import PeftModel
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
@@ -14,6 +13,7 @@ from transformers.utils import logging
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
 from turbo_alignment.modeling import parallel_states
+from turbo_alignment.sequence_parallel.gather_logits import GatherRewardAtIndex
 
 logger = logging.get_logger(__name__)
 
@@ -89,26 +89,9 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         rejected_indices = inputs['rejected_indices'].to(device)
 
         if parallel_states.sequence_parallel_is_initialized():
-            rank = parallel_states.get_sequence_parallel_rank()
-            seq_len_chunk = logits.size(1)
-            offset = rank * seq_len_chunk
-            # logger.warning(
-            #     f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
-
-            def get_rewards(indices):
-                is_local = (indices >= offset) & (indices < offset + seq_len_chunk)
-                local_indices = indices - offset
-                safe_indices = torch.where(is_local, local_indices, torch.zeros_like(local_indices))
-
-                batch_idx = torch.arange(indices.size(0), device=logits.device)
-                rewards = logits[batch_idx, safe_indices].squeeze(-1)
-                rewards = rewards * is_local.to(rewards.dtype)
-
-                dist.all_reduce(rewards, op=dist.ReduceOp.SUM, group=parallel_states.get_sequence_parallel_group())
-                return rewards
-
-            rewards_w = get_rewards(chosen_indices)
-            rewards_l = get_rewards(rejected_indices)
+            sp_group = parallel_states.get_sequence_parallel_group()
+            rewards_w = GatherRewardAtIndex.apply(logits, chosen_indices, sp_group)
+            rewards_l = GatherRewardAtIndex.apply(logits, rejected_indices, sp_group)
         else:
             batch_size = input_ids.shape[0]
             rewards_w = logits[torch.arange(batch_size, device=logits.device), chosen_indices]
