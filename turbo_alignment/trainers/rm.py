@@ -153,43 +153,31 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             state_dict = self.model.state_dict()
         logger.info('state_dict has %d keys', len(state_dict))
 
-        # Handle PEFT ModulesToSaveWrapper around score
-        score_module = core_model.score
-        if hasattr(score_module, 'modules_to_save'):
-            active_adapter = next(iter(score_module.modules_to_save))
-            logger.info('score is a ModulesToSaveWrapper; using active adapter=%s', active_adapter)
-            score_module = score_module.modules_to_save[active_adapter]
-        score_weight_param = score_module.weight
-        logger.info('score_weight_param shape (may be shard under ZeRO-3): %s', score_weight_param.data.shape)
-
-        if is_deepspeed_zero3_enabled():
-            import deepspeed
-            world_size = deepspeed.comm.get_world_size()
-            rank = deepspeed.comm.get_rank()
-            logger.info('ZeRO-3 enabled; gathering score.weight shards from %d ranks (this rank=%d)', world_size, rank)
-
-            local_shard = score_weight_param.data.contiguous()
-            gathered = [torch.zeros_like(local_shard) for _ in range(world_size)]
-            deepspeed.comm.all_gather(gathered, local_shard)
-            full_flat = torch.cat(gathered, dim=0)
-            logger.info('all_gather done; full_flat.shape=%s, ds_numel=%d, ds_shape=%s',
-                        full_flat.shape, score_weight_param.ds_numel, score_weight_param.ds_shape)
-
-            # Trim ZeRO-3 tail-padding and restore original shape
-            full_weight = full_flat.view(-1)[:score_weight_param.ds_numel].reshape(score_weight_param.ds_shape)
-            logger.info('score.weight reconstructed: shape=%s', full_weight.shape)
-        else:
-            logger.info('ZeRO-3 not enabled; using score.weight.data directly, shape=%s', score_weight_param.data.shape)
-            full_weight = score_weight_param.data
-
-        # Inject into state_dict under the key that is actually present
+        # In ZeRO-3, state_dict (if provided by self.accelerator.get_state_dict) already contains
+        # the fully gathered weights. We just need to ensure the score weight is present under the
+        # correct PEFT key if it was saved under a base model key.
         score_key = next((k for k in state_dict if 'score' in k and 'weight' in k), None)
+        
         if score_key is not None:
-            logger.info('Injecting score.weight into state_dict under key=%r, weight.shape=%s', score_key, full_weight.shape)
-            state_dict[score_key] = full_weight.cpu()
+            logger.info('Found score.weight in state_dict under key=%r, shape=%s', score_key, state_dict[score_key].shape)
+            
+            # If we are using PEFT, PEFT's save_pretrained expects the key to match its internal structure
+            # (e.g., base_model.model.score.modules_to_save.default.weight).
+            # If the state_dict has it as just 'score.weight' or 'model.score.weight', we might need to map it.
+            # But normally get_state_dict on the unwrapped model preserves the PEFT keys.
         else:
-            logger.warning('score.weight key not found in state_dict; skipping injection. '
-                           'Available keys: %s', [k for k in state_dict if 'score' in k])
+            logger.warning('score.weight key not found in state_dict. Available keys: %s', [k for k in state_dict if 'score' in k])
 
         logger.info('Calling super()._save(output_dir=%s)', output_dir)
         super()._save(output_dir, state_dict)  # ← _save, not save_model
+
+    def _save_checkpoint(self, model, trial):
+        # We removed the GatheredParameters context manager here because it caused a distributed deadlock:
+        # _save_checkpoint wraps super()._save_checkpoint() on all ranks.
+        # super()._save_checkpoint() calls save_model() which calls get_state_dict() (a collective).
+        # Then save_model() calls _save() ONLY ON RANK 0.
+        # If _save() or anything inside it does a collective (like all_gather), Rank 0 blocks waiting for Rank 1-7.
+        # But Ranks 1-7 already exited save_model() and are waiting at GatheredParameters.__exit__ (another collective).
+        # Deadlock.
+        # Since get_state_dict() already gathers ZeRO-3 parameters correctly, we don't need GatheredParameters here.
+        return super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
