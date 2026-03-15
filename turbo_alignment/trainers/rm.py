@@ -154,22 +154,36 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         logger.info('state_dict has %d keys', len(state_dict))
 
         # In ZeRO-3, state_dict (if provided by self.accelerator.get_state_dict) already contains
-        # the fully gathered weights. We just need to ensure the score weight is present under the
-        # correct PEFT key if it was saved under a base model key.
+        # the fully gathered weights.
         score_key = next((k for k in state_dict if 'score' in k and 'weight' in k), None)
         
+        score_weight = None
         if score_key is not None:
             logger.info('Found score.weight in state_dict under key=%r, shape=%s', score_key, state_dict[score_key].shape)
-            
-            # If we are using PEFT, PEFT's save_pretrained expects the key to match its internal structure
-            # (e.g., base_model.model.score.modules_to_save.default.weight).
-            # If the state_dict has it as just 'score.weight' or 'model.score.weight', we might need to map it.
-            # But normally get_state_dict on the unwrapped model preserves the PEFT keys.
+            score_weight = state_dict[score_key].cpu()
         else:
             logger.warning('score.weight key not found in state_dict. Available keys: %s', [k for k in state_dict if 'score' in k])
 
         logger.info('Calling super()._save(output_dir=%s)', output_dir)
         super()._save(output_dir, state_dict)  # ← _save, not save_model
+
+        # PEFT's save_pretrained often drops modules_to_save keys like score.weight during its internal filtering.
+        # If we have the gathered score.weight, we patch it directly into the saved safetensors file.
+        if score_weight is not None and output_dir is not None:
+            safetensors_path = os.path.join(output_dir, 'adapter_model.safetensors')
+            if os.path.exists(safetensors_path):
+                from safetensors import safe_open
+                from safetensors.torch import save_file
+                tensors = {}
+                with safe_open(safetensors_path, framework='pt', device='cpu') as f:
+                    for k in f.keys():
+                        tensors[k] = f.get_tensor(k)
+                
+                if score_key not in tensors:
+                    logger.info('Patching %s: injecting dropped score.weight under key=%r', safetensors_path, score_key)
+                    tensors[score_key] = score_weight
+                    save_file(tensors, safetensors_path)
+                    logger.info('Patch complete')
 
     def _save_checkpoint(self, model, trial):
         # We removed the GatheredParameters context manager here because it caused a distributed deadlock:
