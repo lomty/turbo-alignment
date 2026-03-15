@@ -1,14 +1,9 @@
-import os
-from pathlib import Path
 from typing import Any
 
 import torch
-from peft import PeftModel
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_pt_utils import nested_detach
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
 from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
@@ -136,15 +131,3 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         labels = labels.long()
 
         return loss, logits, labels
-
-    def _save_checkpoint(self, model, trial):
-        if isinstance(model, PeftModel) and is_deepspeed_zero3_enabled():
-            import deepspeed
-            logger.info('Gathering ZeRO-3 sharded score.weight before PEFT save')
-            # Under ZeRO-3, score.weight is sharded across ranks. Gather full tensor
-            # so PEFT's save_pretrained (called in super()) serializes it correctly
-            # into adapter_model.safetensors as a modules_to_save entry.
-            score_params = list(model.base_model.model.score.parameters())
-            with deepspeed.zero.GatheredParameters(score_params, modifier_rank=0):
-                return super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
-        return super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
