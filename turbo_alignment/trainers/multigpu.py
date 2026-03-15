@@ -19,7 +19,9 @@ from transformers.integrations import get_reporting_integration_callbacks
 
 from turbo_alignment.common.tf.callbacks.common import MetricsCallbackHandler
 from turbo_alignment.sequence_parallel.trainer import TrainerWithSeqP
+from transformers.utils import logging
 
+logger = logging.get_logger(__name__)
 
 class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
     def __init__(
@@ -65,3 +67,25 @@ class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
         )
         self.add_callback(PrinterCallback if self.args.disable_tqdm else ProgressCallback)
         self.control: TrainerControl = self.callback_handler.on_init_end(self.args, self.state, self.control)
+
+    def train(self, *args, **kwargs):
+        if self.is_world_process_zero():
+            total_trainable = 0
+            lines = []
+            for name, param in self.model.named_parameters():
+                if param.requires_grad:
+                    n = param.numel()
+                    total_trainable += n
+                    lines.append(
+                        f"  {name:80s} {str(list(param.shape)):30s} {str(param.dtype):20s} {n:>12,d}"
+                    )
+
+            header = f"  {'Name':80s} {'Shape':30s} {'Dtype':20s} {'#Params':>12}"
+            sep = "  " + "-" * (80 + 30 + 20 + 12 + 9)
+            body = "\n".join(lines) if lines else "  (none)"
+            logger.info(
+                f"Trainable parameters weights:\n{header}\n{sep}\n{body}\n{sep}\n"
+                f"  Total trainable parameters: {total_trainable:,}"
+            )
+        return super().train(*args, **kwargs)
+
