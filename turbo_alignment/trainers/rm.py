@@ -180,4 +180,13 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         # But Ranks 1-7 already exited save_model() and are waiting at GatheredParameters.__exit__ (another collective).
         # Deadlock.
         # Since get_state_dict() already gathers ZeRO-3 parameters correctly, we don't need GatheredParameters here.
-        return super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
+        super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
+
+        if self.is_world_process_zero():
+            output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
+            # Use only trainable parameters as expected keys:
+            # - With PEFT, only adapter weights + modules_to_save are written to disk
+            # - Frozen base model weights are NOT saved in the PEFT checkpoint
+            # - requires_grad=True params matches exactly what PEFT's save_pretrained writes
+            expected_keys = {name for name, param in self.model.named_parameters() if param.requires_grad}
+            self._validate_checkpoint(output_dir, expected_keys)
