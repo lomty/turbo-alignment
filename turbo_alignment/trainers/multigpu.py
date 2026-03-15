@@ -114,6 +114,8 @@ class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
             except Exception as e:
                 logger.warning(f'Could not read {filepath} during checkpoint validation: {e}')
         for filepath in Path(output_dir).glob('*.bin'):
+            if filepath.name == 'training_args.bin':
+                continue
             try:
                 data = torch.load(str(filepath), map_location='cpu', weights_only=True)
                 saved_keys.update(data.keys())
@@ -169,7 +171,9 @@ class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
                             if "score" in name:
                                 state_dict[name] = param.data.cpu().clone()
 
-                        expected_keys_for_validation = set(state_dict.keys())
+                        expected_keys_for_validation = {
+                            k for k, p in self.model.named_parameters() if p.requires_grad
+                        }
                         self._save(output_dir, state_dict=state_dict)
 
                         logger.info('Del state_dict of checkpoint')
@@ -199,6 +203,3 @@ class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
         # Validate checkpoint after all saving is done
         if self.args.should_save and expected_keys_for_validation is not None:
             self._validate_checkpoint(output_dir, expected_keys_for_validation)
-
-
-
