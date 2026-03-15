@@ -138,40 +138,58 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         return loss, logits, labels
 
     def _save(self, output_dir=None, state_dict=None):
+        logger.info('RMTrainer._save called, output_dir=%s', output_dir)
 
         core_model = self.model
         if hasattr(core_model, 'module'):
             core_model = core_model.module  # Unwrap DeepSpeed
+            logger.info('Unwrapped DeepSpeed module')
         if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
             core_model = core_model.base_model.model  # Unwrap PEFT
-
+            logger.info('Unwrapped PEFT base_model')
 
         if state_dict is None:
+            logger.info('state_dict not provided, calling self.model.state_dict()')
             state_dict = self.model.state_dict()
+        logger.info('state_dict has %d keys', len(state_dict))
 
-        score_weight = core_model.score.weight.data
+        # Handle PEFT ModulesToSaveWrapper around score
+        score_module = core_model.score
+        if hasattr(score_module, 'modules_to_save'):
+            active_adapter = next(iter(score_module.modules_to_save))
+            logger.info('score is a ModulesToSaveWrapper; using active adapter=%s', active_adapter)
+            score_module = score_module.modules_to_save[active_adapter]
+        score_weight_param = score_module.weight
+        logger.info('score_weight_param shape (may be shard under ZeRO-3): %s', score_weight_param.data.shape)
 
-        import deepspeed
-        world_size = deepspeed.comm.get_world_size()
-        rank = deepspeed.comm.get_rank()
-        
-        if rank == 0:
-            gathered = [torch.zeros_like(score_weight) for _ in range(world_size)]
+        if is_deepspeed_zero3_enabled():
+            import deepspeed
+            world_size = deepspeed.comm.get_world_size()
+            rank = deepspeed.comm.get_rank()
+            logger.info('ZeRO-3 enabled; gathering score.weight shards from %d ranks (this rank=%d)', world_size, rank)
+
+            local_shard = score_weight_param.data.contiguous()
+            gathered = [torch.zeros_like(local_shard) for _ in range(world_size)]
+            deepspeed.comm.all_gather(gathered, local_shard)
+            full_flat = torch.cat(gathered, dim=0)
+            logger.info('all_gather done; full_flat.shape=%s, ds_numel=%d, ds_shape=%s',
+                        full_flat.shape, score_weight_param.ds_numel, score_weight_param.ds_shape)
+
+            # Trim ZeRO-3 tail-padding and restore original shape
+            full_weight = full_flat[:score_weight_param.ds_numel].reshape(score_weight_param.ds_shape)
+            logger.info('score.weight reconstructed: shape=%s', full_weight.shape)
         else:
-            gathered = None
-        
-        deepspeed.comm.gather(score_weight, gathered, dst=0)
-        
-        if rank == 0:
-            full_weight = torch.cat(gathered, dim=0)
-            
-            # Find the correct key for score.weight in state_dict
-            score_key = 'score.weight'
-            for key in state_dict.keys():
-                if 'score' in key and 'weight' in key:
-                    score_key = key
-                    break
-                    
-            state_dict[score_key] = full_weight.cpu()
+            logger.info('ZeRO-3 not enabled; using score.weight.data directly, shape=%s', score_weight_param.data.shape)
+            full_weight = score_weight_param.data
 
+        # Inject into state_dict under the key that is actually present
+        score_key = next((k for k in state_dict if 'score' in k and 'weight' in k), None)
+        if score_key is not None:
+            logger.info('Injecting score.weight into state_dict under key=%r, weight.shape=%s', score_key, full_weight.shape)
+            state_dict[score_key] = full_weight.cpu()
+        else:
+            logger.warning('score.weight key not found in state_dict; skipping injection. '
+                           'Available keys: %s', [k for k in state_dict if 'score' in k])
+
+        logger.info('Calling super()._save(output_dir=%s)', output_dir)
         super()._save(output_dir, state_dict)  # ← _save, not save_model
