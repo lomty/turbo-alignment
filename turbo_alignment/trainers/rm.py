@@ -138,24 +138,40 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         return loss, logits, labels
 
     def _save(self, output_dir=None, state_dict=None):
+
+        core_model = self.model
+        if hasattr(core_model, 'module'):
+            core_model = core_model.module  # Unwrap DeepSpeed
+        if hasattr(core_model, 'base_model') and hasattr(core_model.base_model, 'model'):
+            core_model = core_model.base_model.model  # Unwrap PEFT
+
+
         if state_dict is None:
             state_dict = self.model.state_dict()
 
-        for name, param in self.model.named_parameters():
-            if 'score.weight' in name:
-                state_dict['score.weight'] = param
-                break
+        score_weight = core_model.score.weight.data
 
-        super().save_model(output_dir, state_dict)
+        import deepspeed
+        world_size = deepspeed.comm.get_world_size()
+        rank = deepspeed.comm.get_rank()
+        
+        if rank == 0:
+            gathered = [torch.zeros_like(score_weight) for _ in range(world_size)]
+        else:
+            gathered = None
+        
+        deepspeed.comm.gather(score_weight, gathered, dst=0)
+        
+        if rank == 0:
+            full_weight = torch.cat(gathered, dim=0)
+            
+            # Find the correct key for score.weight in state_dict
+            score_key = 'score.weight'
+            for key in state_dict.keys():
+                if 'score' in key and 'weight' in key:
+                    score_key = key
+                    break
+                    
+            state_dict[score_key] = full_weight.cpu()
 
-    def _save_checkpoint(self, model, trial):
-        if isinstance(model, PeftModel) and is_deepspeed_zero3_enabled():
-            import deepspeed
-            logger.info('Gathering ZeRO-3 sharded score.weight before PEFT save')
-            # Under ZeRO-3, score.weight is sharded across ranks. Gather full tensor
-            # so PEFT's save_pretrained (called in super()) serializes it correctly
-            # into adapter_model.safetensors as a modules_to_save entry.
-            score_params = list(model.base_model.model.score.parameters())
-            with deepspeed.zero.GatheredParameters(score_params, modifier_rank=0):
-                return super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
-        return super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
+        super()._save(output_dir, state_dict)  # ← _save, not save_model
