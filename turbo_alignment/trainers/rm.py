@@ -176,7 +176,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                         full_flat.shape, score_weight_param.ds_numel, score_weight_param.ds_shape)
 
             # Trim ZeRO-3 tail-padding and restore original shape
-            full_weight = full_flat[:score_weight_param.ds_numel].reshape(score_weight_param.ds_shape)
+            full_weight = full_flat.view(-1)[:score_weight_param.ds_numel].reshape(score_weight_param.ds_shape)
             logger.info('score.weight reconstructed: shape=%s', full_weight.shape)
         else:
             logger.info('ZeRO-3 not enabled; using score.weight.data directly, shape=%s', score_weight_param.data.shape)
