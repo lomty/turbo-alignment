@@ -206,20 +206,14 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
 
         is_peft_model = isinstance(core_model, PeftModel)
 
-        # DeepSpeed path: use DeepSpeed's shard-aware loader
+        # DeepSpeed path: use HF Trainer's shard-aware loader
         # This is required for ZeRO-3 where parameters are sharded across ranks
         if self.is_deepspeed_enabled:
-            logger.info('Using DeepSpeed checkpoint loader for ZeRO-3 compatibility')
-            # deepspeed_load_checkpoint handles sharded parameter loading correctly
-            # It reads from the global_step{N}/ subdirectory created by DeepSpeed
-            # load_module_strict=False for PEFT models to allow structural differences
-            load_path, _ = deepspeed_load_checkpoint(
-                self.model_wrapped, checkpoint_dir, load_module_strict=not is_peft_model
-            )
-            if load_path is None:
-                logger.warning('DeepSpeed checkpoint load returned None for: %s', checkpoint_dir)
-            else:
-                logger.info('DeepSpeed checkpoint loaded from: %s', load_path)
+            logger.info('Using HF Trainer checkpoint loader for ZeRO-3 compatibility')
+            # _load_from_checkpoint handles sharded parameter loading correctly
+            # It reads from the HF-format checkpoint (e.g. adapter_model.safetensors)
+            # using deepspeed.zero.GatheredParameters context internally
+            self._load_from_checkpoint(checkpoint_dir, self.model_wrapped)
             logger.info('Weight reload complete')
             return
 
