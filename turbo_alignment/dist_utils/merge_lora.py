@@ -38,12 +38,24 @@ def checkpoint_merge_lora(adapter_path: str, base_path: str, output_path: str = 
     print(f"Loading LoRA adapter from: {adapter_path}")
     model = PeftModel.from_pretrained(base_model, adapter_path)
 
+    # If the checkpoint contains accumulated base model weights (from in-training merges), load them first
+    base_weights_path = os.path.join(adapter_path, "base_model_weights.safetensors")
+    if os.path.exists(base_weights_path):
+        print(f"Found accumulated base model weights at {base_weights_path}, loading...")
+        from safetensors.torch import load_file
+        base_state_dict = load_file(base_weights_path)
+        # strict=False because it doesn't contain LoRA weights
+        model.load_state_dict(base_state_dict, strict=False)
+
     print("Merging adapter into base model...")
     merged = model.merge_and_unload()
 
-    with safe_open(os.path.join(adapter_path, "adapter_model.safetensors"), framework="pt", device="cpu") as f:
-        print("Patching `score.weight` in model")
-        merged.score.weight.data = f.get_tensor("base_model.model.score.weight")
+    adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
+    if os.path.exists(adapter_weights_path):
+        with safe_open(adapter_weights_path, framework="pt", device="cpu") as f:
+            if "base_model.model.score.weight" in f.keys():
+                print("Patching `score.weight` in model")
+                merged.score.weight.data = f.get_tensor("base_model.model.score.weight")
 
     print(f"Saving merged model to: {output_path}")
     merged.save_pretrained(output_path)

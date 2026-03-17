@@ -186,6 +186,37 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                     save_file(tensors, safetensors_path)
                     logger.info('Patch complete')
 
+        # Save base model weights (which contain accumulated LoRA merges)
+        # Filter out LoRA adapter weights (lora_A, lora_B, lora_embedding)
+        if output_dir is not None:
+            base_weights = {k: v.cpu() for k, v in state_dict.items() if 'lora_' not in k}
+            base_weights_path = os.path.join(output_dir, 'base_model_weights.safetensors')
+            logger.info('Saving accumulated base model weights to %s', base_weights_path)
+            save_file(base_weights, base_weights_path)
+            logger.info('Base model weights saved')
+
+    def _merge_lora_into_base(self, core_model: nn.Module) -> None:
+        """
+        Merges LoRA weights into the base layer weights in-place, then reinitializes
+        the LoRA weights to their default starting state.
+        Must be called inside a GatheredParameters context under ZeRO-3.
+        """
+        logger.info('Merging LoRA weights into base model and reinitializing...')
+        for name, module in core_model.named_modules():
+            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                for adapter_name in module.lora_A:
+                    lora_A = module.lora_A[adapter_name].weight
+                    lora_B = module.lora_B[adapter_name].weight
+                    scaling = module.scaling[adapter_name]
+
+                    # Merge: W = W + (B @ A) * scaling
+                    module.base_layer.weight.data += (lora_B @ lora_A) * scaling
+
+                    # Reinitialize LoRA weights
+                    nn.init.kaiming_uniform_(lora_A, a=math.sqrt(5))
+                    nn.init.zeros_(lora_B)
+        logger.info('LoRA merge and reinitialization complete.')
+
     def _reload_weights_from_checkpoint(self, checkpoint_dir: str) -> None:
         """
         Reload model weights from a checkpoint directory into the live training model.
@@ -236,22 +267,17 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                         else:
                             logger.info('ZeRO-3 PEFT adapter loaded successfully.')
 
+                        # Load accumulated base model weights if present
+                        base_weights_path = os.path.join(checkpoint_dir, 'base_model_weights.safetensors')
+                        if os.path.exists(base_weights_path):
+                            logger.info('Loading accumulated base model weights from: %s', base_weights_path)
+                            base_state_dict = load_file(base_weights_path)
+                            # strict=False because base_state_dict doesn't contain LoRA weights
+                            core_model.load_state_dict(base_state_dict, strict=False)
+                            logger.info('Accumulated base model weights loaded successfully.')
+
                         # Merge loaded LoRA weights into base model and reinitialize LoRA
-                        logger.info('Merging LoRA weights into base model and reinitializing...')
-                        for name, module in core_model.named_modules():
-                            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
-                                for adapter_name in module.lora_A:
-                                    lora_A = module.lora_A[adapter_name].weight
-                                    lora_B = module.lora_B[adapter_name].weight
-                                    scaling = module.scaling[adapter_name]
-
-                                    # Merge: W = W + (B @ A) * scaling
-                                    module.base_layer.weight.data += (lora_B @ lora_A) * scaling
-
-                                    # Reinitialize LoRA weights
-                                    nn.init.kaiming_uniform_(lora_A, a=math.sqrt(5))
-                                    nn.init.zeros_(lora_B)
-                        logger.info('LoRA merge and reinitialization complete.')
+                        self._merge_lora_into_base(core_model)
 
                     # Reset optimizer state to prevent applying stale momentum to reinitialized LoRA weights
                     self._reset_lora_optimizer_state()
