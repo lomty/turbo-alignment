@@ -199,13 +199,23 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         """
         logger.info('Reloading weights from checkpoint: %s', checkpoint_dir)
 
+        # Unwrap model to detect PEFT (needed for both DeepSpeed and non-DeepSpeed paths)
+        core_model = self.model
+        if hasattr(core_model, 'module'):
+            core_model = core_model.module  # Unwrap DeepSpeed or any wrapper
+
+        is_peft_model = isinstance(core_model, PeftModel)
+
         # DeepSpeed path: use DeepSpeed's shard-aware loader
         # This is required for ZeRO-3 where parameters are sharded across ranks
         if self.is_deepspeed_enabled:
             logger.info('Using DeepSpeed checkpoint loader for ZeRO-3 compatibility')
             # deepspeed_load_checkpoint handles sharded parameter loading correctly
             # It reads from the global_step{N}/ subdirectory created by DeepSpeed
-            load_path, _ = deepspeed_load_checkpoint(self.model_wrapped, checkpoint_dir)
+            # load_module_strict=False for PEFT models to allow structural differences
+            load_path, _ = deepspeed_load_checkpoint(
+                self.model_wrapped, checkpoint_dir, load_module_strict=not is_peft_model
+            )
             if load_path is None:
                 logger.warning('DeepSpeed checkpoint load returned None for: %s', checkpoint_dir)
             else:
@@ -214,13 +224,6 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             return
 
         # Non-DeepSpeed path: direct state_dict loading
-        # Determine if this is a PEFT model
-        core_model = self.model
-        if hasattr(core_model, 'module'):
-            core_model = core_model.module  # Unwrap any wrapper
-
-        is_peft_model = isinstance(core_model, PeftModel)
-
         if is_peft_model:
             # Load PEFT adapter weights
             adapter_path = os.path.join(checkpoint_dir, 'adapter_model.safetensors')
@@ -260,7 +263,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             else:
                 logger.warning('No model file found in checkpoint: %s', checkpoint_dir)
 
-
+        logger.info('Weight reload complete')
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
