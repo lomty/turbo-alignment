@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Any
 
@@ -226,8 +227,28 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                     all_params = list(core_model.parameters())
                     with deepspeed.zero.GatheredParameters(all_params, modifier_rank=0):
                         incompatible = set_peft_model_state_dict(core_model, state_dict)
-                    logger.info('ZeRO-3 PEFT adapter loaded. Missing: %s, Unexpected: %s',
-                                incompatible.missing_keys, incompatible.unexpected_keys)
+                        logger.info('ZeRO-3 PEFT adapter loaded. Missing: %s, Unexpected: %s',
+                                    incompatible.missing_keys, incompatible.unexpected_keys)
+
+                        # Merge loaded LoRA weights into base model and reinitialize LoRA
+                        logger.info('Merging LoRA weights into base model and reinitializing...')
+                        for name, module in core_model.named_modules():
+                            if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+                                for adapter_name in module.lora_A:
+                                    lora_A = module.lora_A[adapter_name].weight
+                                    lora_B = module.lora_B[adapter_name].weight
+                                    scaling = module.scaling[adapter_name]
+
+                                    # Merge: W = W + (B @ A) * scaling
+                                    module.base_layer.weight.data += (lora_B @ lora_A) * scaling
+
+                                    # Reinitialize LoRA weights
+                                    nn.init.kaiming_uniform_(lora_A, a=math.sqrt(5))
+                                    nn.init.zeros_(lora_B)
+                        logger.info('LoRA merge and reinitialization complete.')
+
+                    # Reset optimizer state to prevent applying stale momentum to reinitialized LoRA weights
+                    self._reset_lora_optimizer_state()
                 else:
                     logger.warning('No adapter file found in checkpoint: %s', checkpoint_dir)
             else:
@@ -294,6 +315,24 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                 logger.warning('No model file found in checkpoint: %s', checkpoint_dir)
 
         logger.info('Weight reload complete')
+
+    def _reset_lora_optimizer_state(self):
+        """
+        Clears the optimizer state. Necessary after reinitializing LoRA weights,
+        otherwise Adam will apply stale momentum to the newly initialized weights.
+        Under ZeRO-3, we clear the inner optimizer state.
+        """
+        if self.optimizer is None:
+            return
+
+        logger.info('Clearing optimizer state to reset momentum for reinitialized LoRA weights')
+        inner_opt = self.optimizer
+        if hasattr(inner_opt, 'optimizer'):
+            inner_opt = inner_opt.optimizer  # Unwrap DeepSpeedZeroOptimizer
+
+        if hasattr(inner_opt, 'state'):
+            inner_opt.state.clear()
+            logger.info('Optimizer state cleared')
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
