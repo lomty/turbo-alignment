@@ -6,6 +6,7 @@ from peft import PeftModel, set_peft_model_state_dict
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
+from transformers.integrations.deepspeed import deepspeed_load_checkpoint
 from transformers.modeling_utils import PreTrainedModel
 from transformers.trainer_pt_utils import nested_detach
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -192,15 +193,31 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         This is called after each checkpoint save to ensure the in-memory model state
         matches what was written to disk (including any patches applied in _save).
 
-        For PEFT models, loads adapter weights including modules_to_save (e.g., score.weight).
-        For non-PEFT models, loads the full model state_dict.
+        For DeepSpeed ZeRO-3: uses deepspeed_load_checkpoint which handles sharded parameters.
+        For non-DeepSpeed PEFT models: loads adapter weights including modules_to_save.
+        For non-PEFT models: loads the full model state_dict.
         """
         logger.info('Reloading weights from checkpoint: %s', checkpoint_dir)
 
+        # DeepSpeed path: use DeepSpeed's shard-aware loader
+        # This is required for ZeRO-3 where parameters are sharded across ranks
+        if self.is_deepspeed_enabled:
+            logger.info('Using DeepSpeed checkpoint loader for ZeRO-3 compatibility')
+            # deepspeed_load_checkpoint handles sharded parameter loading correctly
+            # It reads from the global_step{N}/ subdirectory created by DeepSpeed
+            load_path, _ = deepspeed_load_checkpoint(self.model_wrapped, checkpoint_dir)
+            if load_path is None:
+                logger.warning('DeepSpeed checkpoint load returned None for: %s', checkpoint_dir)
+            else:
+                logger.info('DeepSpeed checkpoint loaded from: %s', load_path)
+            logger.info('Weight reload complete')
+            return
+
+        # Non-DeepSpeed path: direct state_dict loading
         # Determine if this is a PEFT model
         core_model = self.model
         if hasattr(core_model, 'module'):
-            core_model = core_model.module  # Unwrap DeepSpeed
+            core_model = core_model.module  # Unwrap any wrapper
 
         is_peft_model = isinstance(core_model, PeftModel)
 
@@ -243,7 +260,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             else:
                 logger.warning('No model file found in checkpoint: %s', checkpoint_dir)
 
-        logger.info('Weight reload complete')
+
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
