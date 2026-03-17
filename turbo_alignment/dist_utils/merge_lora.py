@@ -17,15 +17,7 @@ from peft import PeftModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
-def checkpoint_merge_lora():
-    if len(sys.argv) < 2:
-        print("Usage: python merge_lora.py <adapter_checkpoint_path> [output_path]")
-        sys.exit(1)
-
-    adapter_path = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/merged_model"
-    base_path = "/from_s3/model"
-
+def checkpoint_merge_lora(adapter_path: str, base_path: str, output_path: str = "/tmp/merged_model"):
     print(f"Loading tokenizer from: {adapter_path}")
     tokenizer = AutoTokenizer.from_pretrained(adapter_path)
 
@@ -61,4 +53,12 @@ def checkpoint_merge_lora():
 
 
 if __name__ == "__main__":
-    checkpoint_merge_lora()
+    if len(sys.argv) < 2:
+        print("Usage: python merge_lora.py <adapter_checkpoint_path> [output_path]")
+        sys.exit(1)
+
+    adapter_path_arg = sys.argv[1]
+    output_path_arg = sys.argv[2] if len(sys.argv) > 2 else "/tmp/merged_model"
+    base_path_arg = "/from_s3/model"
+    
+    checkpoint_merge_lora(adapter_path_arg, base_path_arg, output_path_arg)
