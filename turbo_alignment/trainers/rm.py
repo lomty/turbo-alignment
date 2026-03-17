@@ -227,8 +227,14 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                     all_params = list(core_model.parameters())
                     with deepspeed.zero.GatheredParameters(all_params, modifier_rank=0):
                         incompatible = set_peft_model_state_dict(core_model, state_dict)
-                        logger.info('ZeRO-3 PEFT adapter loaded. Missing: %s, Unexpected: %s',
-                                    incompatible.missing_keys, incompatible.unexpected_keys)
+                        
+                        unexpected_missing = [k for k in incompatible.missing_keys if 'lora' in k or 'score' in k]
+                        if unexpected_missing:
+                            logger.warning('ZeRO-3 PEFT adapter loaded, but missing trainable keys: %s', unexpected_missing)
+                        if incompatible.unexpected_keys:
+                            logger.warning('ZeRO-3 PEFT adapter loaded with unexpected keys: %s', incompatible.unexpected_keys)
+                        else:
+                            logger.info('ZeRO-3 PEFT adapter loaded successfully.')
 
                         # Merge loaded LoRA weights into base model and reinitialize LoRA
                         logger.info('Merging LoRA weights into base model and reinitializing...')
@@ -336,6 +342,10 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
+
+        # Ensure all ranks have finished writing and patching the checkpoint files before reading
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
         # After saving, reload weights to ensure in-memory state matches disk
         # This is important for ZeRO-3 + PEFT where the save process may have
