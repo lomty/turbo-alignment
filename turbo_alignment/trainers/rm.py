@@ -1,19 +1,19 @@
 import os
-from pathlib import Path
 from typing import Any
 
 import torch
-from peft import PeftModel
+from peft import PeftModel, set_peft_model_state_dict
+from safetensors import safe_open
+from safetensors.torch import load_file, save_file
 from torch import nn
 from transformers.modeling_utils import PreTrainedModel
-from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.trainer_pt_utils import nested_detach
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.utils import logging
 
-from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
 from turbo_alignment.modeling import parallel_states
 from turbo_alignment.sequence_parallel.gather_logits import GatherRewardAtIndex
+from turbo_alignment.trainers.multigpu import MultiGPUCherryPicksTrainer
 
 logger = logging.get_logger(__name__)
 
@@ -174,8 +174,6 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         if score_weight is not None and output_dir is not None:
             safetensors_path = os.path.join(output_dir, 'adapter_model.safetensors')
             if os.path.exists(safetensors_path):
-                from safetensors import safe_open
-                from safetensors.torch import save_file
                 tensors = {}
                 with safe_open(safetensors_path, framework='pt', device='cpu') as f:
                     for k in f.keys():
@@ -187,5 +185,75 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                     save_file(tensors, safetensors_path)
                     logger.info('Patch complete')
 
+    def _reload_weights_from_checkpoint(self, checkpoint_dir: str) -> None:
+        """
+        Reload model weights from a checkpoint directory into the live training model.
+
+        This is called after each checkpoint save to ensure the in-memory model state
+        matches what was written to disk (including any patches applied in _save).
+
+        For PEFT models, loads adapter weights including modules_to_save (e.g., score.weight).
+        For non-PEFT models, loads the full model state_dict.
+        """
+        logger.info('Reloading weights from checkpoint: %s', checkpoint_dir)
+
+        # Determine if this is a PEFT model
+        core_model = self.model
+        if hasattr(core_model, 'module'):
+            core_model = core_model.module  # Unwrap DeepSpeed
+
+        is_peft_model = isinstance(core_model, PeftModel)
+
+        if is_peft_model:
+            # Load PEFT adapter weights
+            adapter_path = os.path.join(checkpoint_dir, 'adapter_model.safetensors')
+            if not os.path.exists(adapter_path):
+                adapter_path = os.path.join(checkpoint_dir, 'adapter_model.bin')
+
+            if os.path.exists(adapter_path):
+                logger.info('Loading PEFT adapter from: %s', adapter_path)
+                if adapter_path.endswith('.safetensors'):
+                    state_dict = load_file(adapter_path)
+                else:
+                    state_dict = torch.load(adapter_path, map_location='cpu', weights_only=False)
+
+                # Use PEFT's set_peft_model_state_dict which handles modules_to_save properly
+                incompatible = set_peft_model_state_dict(core_model, state_dict)
+                logger.info('PEFT adapter loaded. Missing: %s, Unexpected: %s',
+                            incompatible.missing_keys, incompatible.unexpected_keys)
+            else:
+                logger.warning('No adapter file found in checkpoint: %s', checkpoint_dir)
+        else:
+            # Load full model weights for non-PEFT models
+            model_path = os.path.join(checkpoint_dir, 'model.safetensors')
+            if not os.path.exists(model_path):
+                model_path = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+            if os.path.exists(model_path):
+                logger.info('Loading model weights from: %s', model_path)
+                if model_path.endswith('.safetensors'):
+                    state_dict = load_file(model_path)
+                else:
+                    state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
+
+                # Load with strict=False to allow partial loads
+                result = core_model.load_state_dict(state_dict, strict=False)
+                logger.info('Model weights loaded. Missing: %s, Unexpected: %s',
+                           result.missing_keys, result.unexpected_keys)
+            else:
+                logger.warning('No model file found in checkpoint: %s', checkpoint_dir)
+
+        logger.info('Weight reload complete')
+
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
+
+        # After saving, reload weights to ensure in-memory state matches disk
+        # This is important for ZeRO-3 + PEFT where the save process may have
+        # gathered and patched weights (e.g., score.weight)
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        checkpoint_dir = os.path.join(run_dir, checkpoint_folder)
+
+        if os.path.isdir(checkpoint_dir):
+            self._reload_weights_from_checkpoint(checkpoint_dir)
