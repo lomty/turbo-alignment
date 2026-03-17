@@ -156,13 +156,15 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         # In ZeRO-3, state_dict (if provided by self.accelerator.get_state_dict) already contains
         # the fully gathered weights.
         score_key = next((k for k in state_dict if 'score' in k and 'weight' in k), None)
-        
+
         score_weight = None
         if score_key is not None:
-            logger.info('Found score.weight in state_dict under key=%r, shape=%s', score_key, state_dict[score_key].shape)
+            logger.info('Found score.weight in state_dict under key=%r, shape=%s', score_key,
+                        state_dict[score_key].shape)
             score_weight = state_dict[score_key].cpu()
         else:
-            logger.warning('score.weight key not found in state_dict. Available keys: %s', [k for k in state_dict if 'score' in k])
+            logger.warning('score.weight key not found in state_dict. Available keys: %s',
+                           [k for k in state_dict if 'score' in k])
 
         logger.info('Calling super()._save(output_dir=%s)', output_dir)
         super()._save(output_dir, state_dict)  # ← _save, not save_model
@@ -178,7 +180,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                 with safe_open(safetensors_path, framework='pt', device='cpu') as f:
                     for k in f.keys():
                         tensors[k] = f.get_tensor(k)
-                
+
                 if score_key not in tensors:
                     logger.info('Patching %s: injecting dropped score.weight under key=%r', safetensors_path, score_key)
                     tensors[score_key] = score_weight
@@ -186,21 +188,4 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                     logger.info('Patch complete')
 
     def _save_checkpoint(self, model, trial):
-        # We removed the GatheredParameters context manager here because it caused a distributed deadlock:
-        # _save_checkpoint wraps super()._save_checkpoint() on all ranks.
-        # super()._save_checkpoint() calls save_model() which calls get_state_dict() (a collective).
-        # Then save_model() calls _save() ONLY ON RANK 0.
-        # If _save() or anything inside it does a collective (like all_gather), Rank 0 blocks waiting for Rank 1-7.
-        # But Ranks 1-7 already exited save_model() and are waiting at GatheredParameters.__exit__ (another collective).
-        # Deadlock.
-        # Since get_state_dict() already gathers ZeRO-3 parameters correctly, we don't need GatheredParameters here.
         super()._save_checkpoint(model=model, trial=trial)  # pylint: disable=no-member
-
-        if self.is_world_process_zero():
-            output_dir = os.path.join(self.args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
-            # Use only trainable parameters as expected keys:
-            # - With PEFT, only adapter weights + modules_to_save are written to disk
-            # - Frozen base model weights are NOT saved in the PEFT checkpoint
-            # - requires_grad=True params matches exactly what PEFT's save_pretrained writes
-            expected_keys = {name for name, param in self.model.named_parameters() if param.requires_grad}
-            # self._validate_checkpoint(output_dir, expected_keys)

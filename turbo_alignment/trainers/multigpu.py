@@ -27,24 +27,24 @@ from pathlib import Path
 from peft import PeftModel
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 
-
 logger = logging.get_logger(__name__)
+
 
 class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
     def __init__(
-        self,
-        model: PreTrainedModel | nn.Module,
-        data_collator: Callable,
-        args: TrainingArguments,
-        train_dataset: Dataset,
-        eval_dataset: Dataset,
-        processing_class: PreTrainedTokenizerBase
-        | BaseImageProcessor
-        | FeatureExtractionMixin
-        | ProcessorMixin
-        | None = None,
-        callbacks: list[TrainerCallback] | None = None,
-        **kwargs,
+            self,
+            model: PreTrainedModel | nn.Module,
+            data_collator: Callable,
+            args: TrainingArguments,
+            train_dataset: Dataset,
+            eval_dataset: Dataset,
+            processing_class: PreTrainedTokenizerBase
+                              | BaseImageProcessor
+                              | FeatureExtractionMixin
+                              | ProcessorMixin
+                              | None = None,
+            callbacks: list[TrainerCallback] | None = None,
+            **kwargs,
     ):
         ref_model = kwargs.pop('ref_model', None)
         metrics_kwargs = kwargs.pop('metrics_kwargs', None)
@@ -95,53 +95,3 @@ class MultiGPUCherryPicksTrainer(TrainerWithSeqP):
                 f"  Total trainable parameters: {total_trainable:,}"
             )
         return super().train(*args, **kwargs)
-
-    def _validate_checkpoint(self, output_dir: str, expected_keys: set[str]) -> None:
-        """
-        After save_model writes files, reload them from disk and verify
-        every key in expected_keys is present in the saved checkpoint.
-        Logs CRITICAL and raises RuntimeError on mismatch.
-        """
-        if not self.args.should_save:
-            return
-
-        saved_keys: set[str] = set()
-        for filepath in Path(output_dir).glob('*.safetensors'):
-            try:
-                from safetensors import safe_open
-                with safe_open(str(filepath), framework='pt', device='cpu') as f:
-                    saved_keys.update(f.keys())
-            except Exception as e:
-                logger.warning(f'Could not read {filepath} during checkpoint validation: {e}')
-        for filepath in Path(output_dir).glob('*.bin'):
-            if filepath.name == 'training_args.bin':
-                continue
-            try:
-                data = torch.load(str(filepath), map_location='cpu', weights_only=True)
-                saved_keys.update(data.keys())
-            except Exception as e:
-                logger.warning(f'Could not read {filepath} during checkpoint validation: {e}')
-
-        # PEFT might save keys without the 'base_model.model.' prefix if it unwraps it,
-        # so we strip prefixes to do a robust subset check.
-        def strip_prefix(k: str) -> str:
-            k = k.replace('base_model.model.', '')
-            k = k.replace('module.', '')
-            return k
-
-        expected_stripped = {strip_prefix(k) for k in expected_keys}
-        saved_stripped = {strip_prefix(k) for k in saved_keys}
-
-        missing = sorted(expected_stripped - saved_stripped)
-        if missing:
-            msg = (
-                    f'CHECKPOINT VALIDATION FAILED: {len(missing)}/{len(expected_stripped)} '
-                    f'keys missing from {output_dir}:\n' + '\n'.join(f'  MISSING: {k}' for k in missing)
-            )
-            logger.critical(msg)
-            raise RuntimeError(msg)
-        else:
-            logger.info(
-                f'Checkpoint validation passed: all {len(expected_stripped)} keys '
-                f'present in {output_dir}'
-            )
