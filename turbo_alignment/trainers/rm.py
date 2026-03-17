@@ -6,7 +6,6 @@ from peft import PeftModel, set_peft_model_state_dict
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
-from transformers.integrations.deepspeed import deepspeed_load_checkpoint
 from transformers.modeling_utils import PreTrainedModel
 from transformers.trainer_pt_utils import nested_detach
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -206,14 +205,51 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
 
         is_peft_model = isinstance(core_model, PeftModel)
 
-        # DeepSpeed path: use HF Trainer's shard-aware loader
+        # DeepSpeed path: use DeepSpeed's GatheredParameters context
         # This is required for ZeRO-3 where parameters are sharded across ranks
         if self.is_deepspeed_enabled:
-            logger.info('Using HF Trainer checkpoint loader for ZeRO-3 compatibility')
-            # _load_from_checkpoint handles sharded parameter loading correctly
-            # It reads from the HF-format checkpoint (e.g. adapter_model.safetensors)
-            # using deepspeed.zero.GatheredParameters context internally
-            self._load_from_checkpoint(checkpoint_dir, self.model_wrapped)
+            import deepspeed
+            logger.info('Using DeepSpeed GatheredParameters for ZeRO-3 compatibility')
+            if is_peft_model:
+                adapter_path = os.path.join(checkpoint_dir, 'adapter_model.safetensors')
+                if not os.path.exists(adapter_path):
+                    adapter_path = os.path.join(checkpoint_dir, 'adapter_model.bin')
+
+                if os.path.exists(adapter_path):
+                    logger.info('Loading PEFT adapter from: %s', adapter_path)
+                    if adapter_path.endswith('.safetensors'):
+                        state_dict = load_file(adapter_path)
+                    else:
+                        state_dict = torch.load(adapter_path, map_location='cpu', weights_only=False)
+
+                    # Temporarily gather sharded parameters to full shape, load on rank 0, then re-shard
+                    all_params = list(core_model.parameters())
+                    with deepspeed.zero.GatheredParameters(all_params, modifier_rank=0):
+                        incompatible = set_peft_model_state_dict(core_model, state_dict)
+                    logger.info('ZeRO-3 PEFT adapter loaded. Missing: %s, Unexpected: %s',
+                                incompatible.missing_keys, incompatible.unexpected_keys)
+                else:
+                    logger.warning('No adapter file found in checkpoint: %s', checkpoint_dir)
+            else:
+                model_path = os.path.join(checkpoint_dir, 'model.safetensors')
+                if not os.path.exists(model_path):
+                    model_path = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+                if os.path.exists(model_path):
+                    logger.info('Loading model weights from: %s', model_path)
+                    if model_path.endswith('.safetensors'):
+                        state_dict = load_file(model_path)
+                    else:
+                        state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
+
+                    all_params = list(core_model.parameters())
+                    with deepspeed.zero.GatheredParameters(all_params, modifier_rank=0):
+                        result = core_model.load_state_dict(state_dict, strict=False)
+                    logger.info('ZeRO-3 Model weights loaded. Missing: %s, Unexpected: %s',
+                               result.missing_keys, result.unexpected_keys)
+                else:
+                    logger.warning('No model file found in checkpoint: %s', checkpoint_dir)
+
             logger.info('Weight reload complete')
             return
 
