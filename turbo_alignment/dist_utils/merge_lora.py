@@ -44,8 +44,20 @@ def checkpoint_merge_lora(adapter_path: str, base_path: str, output_path: str = 
         print(f"Found accumulated base model weights at {base_weights_path}, loading...")
         from safetensors.torch import load_file
         base_state_dict = load_file(base_weights_path)
+        
+        # Filter base_state_dict to only load keys whose shape matches the current model
+        # This safely skips embedding weights if the training model had a different vocab size
+        current_state = model.state_dict()
+        filtered_base_state = {
+            k: v for k, v in base_state_dict.items()
+            if k in current_state and current_state[k].shape == v.shape
+        }
+        skipped_keys = set(base_state_dict.keys()) - set(filtered_base_state.keys())
+        if skipped_keys:
+            print(f"Skipped {len(skipped_keys)} keys due to shape mismatch or missing in current model (e.g. embeddings)")
+        
         # strict=False because it doesn't contain LoRA weights
-        model.load_state_dict(base_state_dict, strict=False)
+        model.load_state_dict(filtered_base_state, strict=False)
 
     print("Merging adapter into base model...")
     merged = model.merge_and_unload()

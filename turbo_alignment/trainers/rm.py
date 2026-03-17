@@ -180,7 +180,8 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
                     for k in f.keys():
                         tensors[k] = f.get_tensor(k)
 
-                if score_key not in tensors:
+                modules_to_save_key = next((k for k in tensors if 'score' in k and 'modules_to_save' in k), None)
+                if score_key not in tensors and modules_to_save_key is None:
                     logger.info('Patching %s: injecting dropped score.weight under key=%r', safetensors_path, score_key)
                     tensors[score_key] = score_weight
                     save_file(tensors, safetensors_path)
