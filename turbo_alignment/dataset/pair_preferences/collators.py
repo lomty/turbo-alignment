@@ -143,6 +143,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)
         batch['position_ids'] = self._get_position_ids(boundaries_tensor, max_seq_len)
 
+        batch['context_end_indices'] = boundaries_tensor[:, 0] - 1  # Last token of context
         batch['chosen_indices'] = boundaries_tensor[:, 1] - 1
         batch['rejected_indices'] = boundaries_tensor[:, 2] - 1
 
