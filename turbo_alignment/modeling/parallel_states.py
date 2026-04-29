@@ -4,6 +4,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 from torch import distributed as dist
 
+
 """Model and data parallel groups."""
 
 """
@@ -162,11 +163,14 @@ def initialize_model_parallel(
     #     if not pipeline_model_parallel_size > 2:
     #         raise RuntimeError(
     #             "pipeline-model-parallel size should be greater than 2 with " "interleaved schedule")
-    #     #     #     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
+    #     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
+    #     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
+    #     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
     #     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
 
     # if pipeline_model_parallel_split_rank is not None:
-    #     #     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
+    #     global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    #     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
 
     rank = dist.get_rank()
 
@@ -293,6 +297,7 @@ def initialize_model_parallel(
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
 
     # Build the FP8 groups.
+    global _AMAX_REDUCTION_GROUP
     assert _AMAX_REDUCTION_GROUP is None, "FP8 amax reduction group is already initialized"
     # if use_fp8:
     #     amax_group_size: int = tensor_model_parallel_size * data_parallel_size
@@ -409,31 +414,37 @@ def get_amax_reduction_group():
 
 def set_tensor_model_parallel_world_size(world_size):
     """Set the tensor model parallel size"""
+    global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
 def set_sequence_parallel_world_size(world_size):
     """Set the sequence parallel size"""
+    global _SEQUENCE_PARALLEL_WORLD_SIZE
     _SEQUENCE_PARALLEL_WORLD_SIZE = world_size
 
 
 def set_sequence_data_parallel_world_size(world_size):
     """Set the sequence parallel size"""
+    global _SEQUENCE_DATA_PARALLEL_WORLD_SIZE
     _SEQUENCE_DATA_PARALLEL_WORLD_SIZE = world_size
 
 
 def set_pipeline_model_parallel_world_size(world_size):
     """Set the pipeline model parallel size"""
+    global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
 def set_virtual_pipeline_model_parallel_world_size(world_size):
     """Set the virtual pipeline model parallel size"""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
+    global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     return dist.get_world_size(group=get_tensor_model_parallel_group())
@@ -454,6 +465,7 @@ def get_sequence_parallel_world_size_or_none():
 
 def get_sequence_parallel_world_size():
     """Return world size for the sequence parallel group."""
+    global _SEQUENCE_PARALLEL_WORLD_SIZE
     if _SEQUENCE_PARALLEL_WORLD_SIZE is not None:
         return _SEQUENCE_PARALLEL_WORLD_SIZE
     return dist.get_world_size(group=get_sequence_parallel_group())
@@ -461,6 +473,7 @@ def get_sequence_parallel_world_size():
 
 def get_sequence_data_parallel_world_size():
     """Return world size for the sequence parallel group."""
+    global _SEQUENCE_DATA_PARALLEL_WORLD_SIZE
     if _SEQUENCE_DATA_PARALLEL_WORLD_SIZE is not None:
         return _SEQUENCE_DATA_PARALLEL_WORLD_SIZE
     return dist.get_world_size(group=get_sequence_data_parallel_group())
@@ -468,6 +481,7 @@ def get_sequence_data_parallel_world_size():
 
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
+    global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     return dist.get_world_size(group=get_pipeline_model_parallel_group())
@@ -475,6 +489,7 @@ def get_pipeline_model_parallel_world_size():
 
 def set_tensor_model_parallel_rank(rank):
     """Set tensor model parallel rank."""
+    global _MPU_TENSOR_MODEL_PARALLEL_RANK
     _MPU_TENSOR_MODEL_PARALLEL_RANK = rank
 
 
@@ -487,26 +502,31 @@ def get_model_parallel_rank():
 
 def set_sequence_parallel_rank(rank):
     """Set sequence parallel rank."""
+    global _SEQUENCE_PARALLEL_RANK
     _SEQUENCE_PARALLEL_RANK = rank
 
 
 def set_sequence_data_parallel_rank(rank):
     """Set sequence parallel rank."""
+    global _SEQUENCE_DATA_PARALLEL_RANK
     _SEQUENCE_DATA_PARALLEL_RANK = rank
 
 
 def set_pipeline_model_parallel_rank(rank):
     """Set pipeline model parallel rank."""
+    global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = rank
 
 
 def set_pipeline_model_parallel_split_rank(rank):
     """Set pipeline model parallel split rank."""
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
 
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
+    global _MPU_TENSOR_MODEL_PARALLEL_RANK
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     return dist.get_rank(group=get_tensor_model_parallel_group())
@@ -514,6 +534,7 @@ def get_tensor_model_parallel_rank():
 
 def get_pipeline_model_parallel_rank():
     """Return my rank for the pipeline model parallel group."""
+    global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
     return dist.get_rank(group=get_pipeline_model_parallel_group())
@@ -521,11 +542,13 @@ def get_pipeline_model_parallel_rank():
 
 def get_pipeline_model_parallel_split_rank():
     """Return pipeline model parallel split rank."""
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
 def get_sequence_parallel_rank():
     """Return my rank for the sequence parallel group."""
+    global _SEQUENCE_PARALLEL_RANK
     if _SEQUENCE_PARALLEL_RANK is not None:
         return _SEQUENCE_PARALLEL_RANK
     return dist.get_rank(group=get_sequence_parallel_group())
@@ -533,6 +556,7 @@ def get_sequence_parallel_rank():
 
 def get_sequence_data_parallel_rank():
     """Return my rank for the sequence data parallel group."""
+    global _SEQUENCE_DATA_PARALLEL_RANK
     if _SEQUENCE_DATA_PARALLEL_RANK is not None:
         return _SEQUENCE_DATA_PARALLEL_RANK
     return dist.get_rank(group=get_sequence_data_parallel_group())
@@ -590,6 +614,7 @@ def is_pipeline_stage_before_split(rank=None):
         return True
     if rank is None:
         rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
         return True
     if rank < _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
@@ -604,6 +629,7 @@ def is_pipeline_stage_after_split(rank=None):
         return True
     if rank is None:
         rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
         return True
     if rank >= _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
@@ -620,16 +646,19 @@ def is_pipeline_stage_at_split():
 
 def get_virtual_pipeline_model_parallel_rank():
     """Return the virtual pipeline-parallel rank."""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     return _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
 
 
 def set_virtual_pipeline_model_parallel_rank(rank):
     """Set the virtual pipeline-parallel rank."""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = rank
 
 
 def get_virtual_pipeline_model_parallel_world_size():
     """Return the virtual pipeline-parallel world size."""
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     return _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
 
 
@@ -746,12 +775,19 @@ def destroy_model_parallel():
     _EMBEDDING_GROUP = None
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
+    global _AMAX_REDUCTION_GROUP
     _AMAX_REDUCTION_GROUP = None
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
+    global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+    global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
+    global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+    global _MPU_TENSOR_MODEL_PARALLEL_RANK
     _MPU_TENSOR_MODEL_PARALLEL_RANK = None
+    global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
     # global _GLOBAL_MEMORY_BUFFER
     # _GLOBAL_MEMORY_BUFFER = None
