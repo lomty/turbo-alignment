@@ -55,15 +55,40 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
 
         attention_mask = torch.finfo(model.dtype).min * (attention_mask == 0).to(model.dtype)
 
-        hidden_states = model.model(
+        root_model = model.module if hasattr(model, 'module') else model
+
+        # For PEFT models this resolves to the wrapped HF model
+        wrapped_model = (
+            getattr(getattr(root_model, 'base_model', None), 'model', None)
+            or root_model
+        )
+
+        # Sequence-classification model keeps transformer backbone in `.model`
+        backbone_model = getattr(wrapped_model, 'model', None)
+        score_head = getattr(wrapped_model, 'score', None) or getattr(root_model, 'score', None)
+
+        if backbone_model is None:
+            raise AttributeError('Unable to find transformer backbone model for RM training')
+        if score_head is None:
+            raise AttributeError('Unable to find score head for RM training')
+
+        outputs = backbone_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             use_cache=False,
-        ).last_hidden_state
-        logits = model.score(hidden_states)  # [batch_size, seq_len, 1]
+            return_dict=True,
+        )
 
-        # Extract rewards at segment boundaries from the sequentially packed sequence
+        if getattr(outputs, 'last_hidden_state', None) is not None:
+            hidden_states = outputs.last_hidden_state
+        elif isinstance(outputs, tuple) and len(outputs) > 0:
+            hidden_states = outputs[0]
+        else:
+            raise AttributeError('Backbone output has no last_hidden_state')
+
+        logits = score_head(hidden_states)  # [batch_size, seq_len, 1]
+
         chosen_indices = inputs['chosen_indices'].to(device)
         rejected_indices = inputs['rejected_indices'].to(device)
 
