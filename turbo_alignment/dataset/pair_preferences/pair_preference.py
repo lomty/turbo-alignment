@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Any, overload
 
-import torch
 from transformers import PreTrainedTokenizerBase
 from typing_extensions import Self
 
@@ -29,12 +28,12 @@ logger = get_project_logger()
 @PairPreferenceDatasetTypeRegistry.register(DatasetStrategy.TRAIN)
 class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
     def __init__(
-            self,
-            source: DatasetSourceSettings,
-            settings: PairPreferenceDatasetSettings,
-            tokenizer: PreTrainedTokenizerBase,
-            seed: int,
-            read: bool = True,
+        self,
+        source: DatasetSourceSettings,
+        settings: PairPreferenceDatasetSettings,
+        tokenizer: PreTrainedTokenizerBase,
+        seed: int,
+        read: bool = True,
     ):
         self._add_labels = settings.add_labels
         settings.chat_settings.keep_end = True
@@ -52,18 +51,21 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
             self._read()
 
     def _build_chat_record(self, record: PairPreferenceRecord, answer: ChatMessage) -> ChatDatasetRecord:
-        context_messages = [ChatMessage(role=msg.role, content=msg.content, disable_loss=True)
-                            for msg in record.context]
+        context_messages = [
+            ChatMessage(role=msg.role, content=msg.content, disable_loss=True) for msg in record.context
+        ]
         return ChatDatasetRecord(id=record.id, messages=context_messages + [answer])
 
     def convert_records(self, records: list[PairPreferenceRecord]) -> list[dict[str, Any] | None]:
         # Build chat records for chosen and rejected using helper method
         chosen_chat_records = [
             self._build_chat_record(record, ChatMessage(role=record.answer_w.role, content=record.answer_w.content))
-            for record in records]
+            for record in records
+        ]
         rejected_chat_records = [
             self._build_chat_record(record, ChatMessage(role=record.answer_l.role, content=record.answer_l.content))
-            for record in records]
+            for record in records
+        ]
 
         tokenized_chosen = self._chat_dataset.convert_records(chosen_chat_records)
         tokenized_rejected = self._chat_dataset.convert_records(rejected_chat_records)
@@ -73,13 +75,15 @@ class PairPreferenceDataset(AlignmentDataset[PairPreferenceRecord]):
             if not (chosen_tok and rejected_tok):
                 continue
 
-            output.append({
-                'id': record.id,
-                'inputs_context': chosen_tok['context_ids'].squeeze(0),
-                'inputs_chosen': chosen_tok['answer_ids'].squeeze(0),
-                'inputs_rejected': rejected_tok['answer_ids'].squeeze(0),
-                'precomputed_margin': record.precomputed_margin,
-            })
+            output.append(
+                {
+                    'id': record.id,
+                    'inputs_context': chosen_tok['context_ids'].squeeze(0),
+                    'inputs_chosen': chosen_tok['answer_ids'].squeeze(0),
+                    'inputs_rejected': rejected_tok['answer_ids'].squeeze(0),
+                    'precomputed_margin': record.precomputed_margin,
+                }
+            )
 
         return output
 

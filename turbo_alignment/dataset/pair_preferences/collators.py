@@ -21,10 +21,10 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
     """
 
     def __init__(
-            self,
-            tokenizer: PreTrainedTokenizerBase,
-            add_labels: bool = True,
-            pad_to_multiple_of: int | None = None,
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        add_labels: bool = True,
+        pad_to_multiple_of: int | None = None,
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -48,9 +48,9 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         input_ids = torch.cat([context, chosen, rejected])
 
         boundaries = (
-            len(context),                               # context_end
-            len(context) + len(chosen),                 # chosen_end
-            len(context) + len(chosen) + len(rejected)  # rejected_end
+            len(context),  # context_end
+            len(context) + len(chosen),  # chosen_end
+            len(context) + len(chosen) + len(rejected),  # rejected_end
         )
 
         return input_ids, boundaries, ex.get('precomputed_margin')
@@ -65,27 +65,26 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
             Tensor[batch_size, 1, max_seq_len, max_seq_len] where 1 = attend, 0 = mask
         """
         batch_size = boundaries_tensor.shape[0]
-        
+
         mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device))
         mask = mask[None, None].expand(batch_size, 1, -1, -1).clone()
 
         positions = torch.arange(max_seq_len, device=device)
         row_idx = positions.view(1, 1, -1, 1)
         col_idx = positions.view(1, 1, 1, -1)
-        
+
         context_grid = boundaries_tensor[:, 0].view(-1, 1, 1, 1)
         chosen_grid = boundaries_tensor[:, 1].view(-1, 1, 1, 1)
         rejected_grid = boundaries_tensor[:, 2].view(-1, 1, 1, 1)
-        
+
         # Exclude positions where rejected segment (rows) attends to chosen segment (cols)
         rejected_mask = (
-            (row_idx >=  chosen_grid) & (row_idx < rejected_grid) &
-            (col_idx >= context_grid) & (col_idx < chosen_grid)
+            (row_idx >= chosen_grid) & (row_idx < rejected_grid) & (col_idx >= context_grid) & (col_idx < chosen_grid)
         )
-        
+
         # Apply exclusion in-place for memory efficiency
         mask &= ~rejected_mask
-        
+
         return mask
 
     def _get_position_ids(self, boundaries_tensor: torch.Tensor, max_seq_len: int) -> torch.Tensor:
@@ -98,27 +97,30 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
             Tensor[batch_size, max_seq_len] position IDs
         """
         batch_size = boundaries_tensor.shape[0]
-        ctx_ends, chosen_ends, rejected_ends = boundaries_tensor[:, 0], boundaries_tensor[:, 1], boundaries_tensor[:, 2]
+        ctx_ends, chosen_ends, rejected_ends = (
+            boundaries_tensor[:, 0],
+            boundaries_tensor[:, 1],
+            boundaries_tensor[:, 2],
+        )
 
         base_positions = torch.arange(max_seq_len, dtype=torch.long)
         position_ids = base_positions.unsqueeze(0).expand(batch_size, max_seq_len).clone()
-        
+
         positions_grid = base_positions.unsqueeze(0).expand(batch_size, -1)  # [batch_size, max_seq_len]
-        
-        rejected_mask = (
-                (positions_grid >= chosen_ends.unsqueeze(1)) &
-                (positions_grid < rejected_ends.unsqueeze(1))
-        )
-        
+
+        rejected_mask = (positions_grid >= chosen_ends.unsqueeze(1)) & (positions_grid < rejected_ends.unsqueeze(1))
+
         # For each position in rejected segment, compute: ctx_end + (pos - chosen_end)
         offset_positions = ctx_ends.unsqueeze(1) + (positions_grid - chosen_ends.unsqueeze(1))
-        
+
         # Apply offset positions only to rejected segments
         position_ids = torch.where(rejected_mask, offset_positions, position_ids)
-        
+
         return position_ids
 
-    def __call__(self, examples: list[dict[str, Any]], return_tensors=None) -> dict[str, Any]:  # type: ignore[override]
+    def __call__(
+        self, examples: list[dict[str, Any]], return_tensors=None
+    ) -> dict[str, Any]:  # type: ignore[override]
         """
         Collate batch using sequential packing: [context | chosen | rejected].
 

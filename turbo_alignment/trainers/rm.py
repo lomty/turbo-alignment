@@ -33,11 +33,11 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
     """
 
     def compute_loss(
-            self,
-            model,
-            inputs,
-            return_outputs=False,
-            num_items_in_batch=None,  # pylint: disable=unused-argument
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        num_items_in_batch=None,  # pylint: disable=unused-argument
     ) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
         Compute ranking loss from sequentially packed inputs.
@@ -72,7 +72,6 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
             seq_len_chunk = logits.size(1)
             offset = rank * seq_len_chunk
             # logger.warning(
-            #     f"input_ids shape {input_ids.shape}, attention_mask shape {attention_mask.shape}, chosen_indices shape {inputs['chosen_indices'].shape}")
 
             def get_rewards(indices):
                 is_local = (indices >= offset) & (indices < offset + seq_len_chunk)
@@ -100,11 +99,11 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         return loss
 
     def prediction_step(  # type: ignore[override]  #  pylint: disable=signature-differs
-            self,
-            model: PreTrainedModel | nn.Module,
-            inputs: dict[str, dict[str, torch.Tensor]],
-            prediction_loss_only: bool,
-            ignore_keys: list[str] | None,
+        self,
+        model: PreTrainedModel | nn.Module,
+        inputs: dict[str, dict[str, torch.Tensor]],
+        prediction_loss_only: bool,
+        ignore_keys: list[str] | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         inputs = self._prepare_inputs(inputs)  # type: ignore[arg-type]
         if ignore_keys is None:

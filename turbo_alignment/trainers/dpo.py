@@ -574,11 +574,9 @@ class DPOTrainer(TrainerWithSeqP):
         eval_dataset: Dataset,
         ref_model: PreTrainedModel | nn.Module | None = None,
         sft_model: PreTrainedModel | nn.Module | None = None,
-        processing_class: PreTrainedTokenizerBase
-        | BaseImageProcessor
-        | FeatureExtractionMixin
-        | ProcessorMixin
-        | None = None,
+        processing_class: (
+            PreTrainedTokenizerBase | BaseImageProcessor | FeatureExtractionMixin | ProcessorMixin | None
+        ) = None,
         callbacks: list[TrainerCallback] | None = None,
         **kwargs,
     ):
@@ -717,11 +715,14 @@ class DPOTrainer(TrainerWithSeqP):
         labels_masked = local_labels.clone()
         labels_masked[labels_masked == DISABLE_LOSS_LABEL] = 0
 
-        per_token_logps = torch.gather(
-            local_logits.log_softmax(-1),
-            dim=2,
-            index=labels_masked.unsqueeze(2),
-        ).squeeze(2) * loss_mask.float()
+        per_token_logps = (
+            torch.gather(
+                local_logits.log_softmax(-1),
+                dim=2,
+                index=labels_masked.unsqueeze(2),
+            ).squeeze(2)
+            * loss_mask.float()
+        )
 
         bsz, local_len = per_token_logps.shape
 
@@ -730,15 +731,18 @@ class DPOTrainer(TrainerWithSeqP):
             # logits length before local shift corresponds to local chunk size
             seq_len_chunk = logits.size(1)
             offset = rank * seq_len_chunk
-            positions = torch.arange(
-                offset,
-                offset + local_len,
-                device=per_token_logps.device,
-            ).unsqueeze(0).expand(bsz, -1)
+            positions = (
+                torch.arange(
+                    offset,
+                    offset + local_len,
+                    device=per_token_logps.device,
+                )
+                .unsqueeze(0)
+                .expand(bsz, -1)
+            )
 
-            seg_mask = (
-                (positions > segment_start_indices.unsqueeze(1))
-                & (positions <= segment_end_indices.unsqueeze(1))
+            seg_mask = (positions > segment_start_indices.unsqueeze(1)) & (
+                positions <= segment_end_indices.unsqueeze(1)
             )
 
             local_sum = (per_token_logps * seg_mask.float()).sum(dim=1)
@@ -752,10 +756,7 @@ class DPOTrainer(TrainerWithSeqP):
             return local_sum
 
         positions = torch.arange(local_len, device=per_token_logps.device).unsqueeze(0).expand(bsz, -1)
-        seg_mask = (
-            (positions > segment_start_indices.unsqueeze(1))
-            & (positions <= segment_end_indices.unsqueeze(1))
-        )
+        seg_mask = (positions > segment_start_indices.unsqueeze(1)) & (positions <= segment_end_indices.unsqueeze(1))
 
         seg_sum = (per_token_logps * seg_mask.float()).sum(dim=1)
         if average_log_prob:
@@ -998,9 +999,7 @@ class DPOTrainer(TrainerWithSeqP):
                     precomputed_margins=precomputed_margins,
                 )
 
-            metrics = self._compute_metrics(
-                metrics, prefix + 'rewards/sft_', sft_chosen_rewards, sft_rejected_rewards
-            )
+            metrics = self._compute_metrics(metrics, prefix + 'rewards/sft_', sft_chosen_rewards, sft_rejected_rewards)
 
         return losses.mean() / parallel_states.get_sequence_parallel_world_size_or_one(), metrics
 
