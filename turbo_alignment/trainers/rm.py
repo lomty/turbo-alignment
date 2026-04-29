@@ -58,10 +58,7 @@ class RMTrainer(MultiGPUCherryPicksTrainer):
         root_model = model.module if hasattr(model, 'module') else model
 
         # For PEFT models this resolves to the wrapped HF model
-        wrapped_model = (
-            getattr(getattr(root_model, 'base_model', None), 'model', None)
-            or root_model
-        )
+        wrapped_model = getattr(getattr(root_model, 'base_model', None), 'model', None) or root_model
 
         # Sequence-classification model keeps transformer backbone in `.model`
         backbone_model = getattr(wrapped_model, 'model', None)
