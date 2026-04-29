@@ -1,11 +1,9 @@
-import inspect
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 import torch
 import torch.distributed as dist
-import torch.distributed.nn.functional as dist_functional
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset
@@ -20,7 +18,7 @@ from transformers import (
     TrainerCallback,
     TrainerControl,
 )
-from transformers.integrations import get_reporting_integration_callbacks, is_deepspeed_available
+from transformers.integrations import get_reporting_integration_callbacks
 from transformers.modeling_utils import PreTrainedModel
 
 from turbo_alignment.common.logging import get_project_logger
@@ -46,7 +44,6 @@ from turbo_alignment.settings.pipelines.train.dpo import (
     SlicHfLossSettings,
     SyncRefModelSettings,
 )
-from turbo_alignment.sequence_parallel.collator import pad_for_sequence_parallel
 from turbo_alignment.trainers.utils import (
     DPOLossRegistry,
     prepare_model,
@@ -55,23 +52,7 @@ from turbo_alignment.modeling import parallel_states
 from turbo_alignment.sequence_parallel.trainer import TrainerWithSeqP
 from .base_args import TrainingArgumentsWithSeqP
 
-if is_deepspeed_available():
-    from deepspeed.runtime.engine import DeepSpeedEngine
-else:
-    DeepSpeedEngine = None
-
 logger = get_project_logger()
-
-
-def get_actual_forward(model: nn.Module):
-    if DeepSpeedEngine is not None and isinstance(model, DeepSpeedEngine):
-        model = model.module
-
-    return model.forward
-
-
-def require_position_ids(model: nn.Module):
-    return 'position_ids' in inspect.signature(get_actual_forward(model)).parameters
 
 
 @DPOLossRegistry.register(DPOLossesType.SIGMOID)
@@ -702,53 +683,10 @@ class DPOTrainer(TrainerWithSeqP):
         """
         Run model forward over packed [context | chosen | rejected].
 
-        - Converts 4D boolean attention mask to additive form.
-        - Applies sequence-parallel padding/slicing if SP is enabled.
+        Follows RM-style behavior: sequence-parallel padding/splitting is handled
+        upstream by DataCollatorForSequenceParallism, so trainer does not pad/slice.
         """
         attn_additive = torch.finfo(model.dtype).min * (attention_mask_4d == 0).to(model.dtype)
-
-        if parallel_states.sequence_parallel_is_initialized():
-            sp_world = parallel_states.get_sequence_parallel_world_size()
-            sp_rank = parallel_states.get_sequence_parallel_rank()
-
-            input_ids_p = pad_for_sequence_parallel(
-                input_ids,
-                sp_world,
-                self.tokenizer.pad_token_id,  # type: ignore[union-attr]
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-            attn_p = pad_for_sequence_parallel(
-                attn_additive,
-                sp_world,
-                0,
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-            pos_p = pad_for_sequence_parallel(
-                position_ids,
-                sp_world,
-                0,
-                padding_side=self.tokenizer.padding_side,  # type: ignore[union-attr]
-            )
-
-            chunk = input_ids_p.size(-1) // sp_world
-            start = sp_rank * chunk
-            end = start + chunk
-
-            input_ids_local = input_ids_p[:, start:end].clone()
-            pos_local = pos_p[:, start:end]
-            # 4D additive mask: rows for the local chunk attend to all keys
-            if attn_p.dim() == 4:
-                attn_local = attn_p[:, :, start:end, :]
-            else:
-                attn_local = attn_p[:, start:end]
-
-            return model(
-                input_ids=input_ids_local,
-                attention_mask=attn_local,
-                position_ids=pos_local,
-                use_cache=False,
-            ).logits.to(torch.float32)
-
         return model(
             input_ids=input_ids,
             attention_mask=attn_additive,
@@ -768,71 +706,52 @@ class DPOTrainer(TrainerWithSeqP):
         Sum (or average) log-probabilities for tokens in
         (segment_start_indices, segment_end_indices].
 
-        Sequence-parallel aware: `labels` are full-length pre-shift; in SP mode
-        the function pads labels, slices for the local rank, and all-reduces
-        per-segment sums (and counts when averaging).
+        SP behavior mirrors RM: inputs are already rank-local (split in collator),
+        then per-rank segment sums are all-reduced across sequence-parallel group.
         """
-        if parallel_states.sequence_parallel_is_initialized():
-            sp_world = parallel_states.get_sequence_parallel_world_size()
-            sp_rank = parallel_states.get_sequence_parallel_rank()
+        # Local next-token shift
+        local_logits = logits[:, :-1, :]
+        local_labels = labels[:, 1:].clone()
 
-            labels_padded = pad_for_sequence_parallel(labels, sp_world, -100)
-            full_seq_len = labels_padded.size(1)
-            chunk = full_seq_len // sp_world
-            start = sp_rank * chunk
-            end = start + chunk
-
-            if sp_rank + 1 == sp_world:
-                local_logits = logits[:, :-1, :]
-            else:
-                local_logits = logits
-
-            local_labels = labels_padded[:, start + 1 : end + 1].clone()
-            loss_mask = local_labels != DISABLE_LOSS_LABEL
-            local_labels_masked = local_labels.clone()
-            local_labels_masked[local_labels == DISABLE_LOSS_LABEL] = 0
-
-            per_token_logps = torch.gather(
-                local_logits.log_softmax(-1),
-                dim=2,
-                index=local_labels_masked.unsqueeze(2),
-            ).squeeze(2) * loss_mask.float()
-
-            local_positions_global = torch.arange(
-                start,
-                start + per_token_logps.size(1),
-                device=per_token_logps.device,
-            ).unsqueeze(0).expand(per_token_logps.size(0), -1)
-
-            seg_mask = (
-                (local_positions_global > segment_start_indices.unsqueeze(1))
-                & (local_positions_global <= segment_end_indices.unsqueeze(1))
-            )
-
-            local_sum = (per_token_logps * seg_mask.float()).sum(dim=1)
-            global_sum = dist_functional.all_reduce(local_sum, op=dist.ReduceOp.SUM)
-
-            if average_log_prob:
-                local_n = seg_mask.sum(dim=1).float()
-                global_n = dist_functional.all_reduce(local_n, op=dist.ReduceOp.SUM)
-                return torch.where(global_n > 0, global_sum / global_n, global_sum)
-            return global_sum
-
-        # Non-SP path
-        logits = logits[:, :-1, :]
-        labels = labels[:, 1:].clone()
-        loss_mask = labels != DISABLE_LOSS_LABEL
-        labels_masked = labels.clone()
+        loss_mask = local_labels != DISABLE_LOSS_LABEL
+        labels_masked = local_labels.clone()
         labels_masked[labels_masked == DISABLE_LOSS_LABEL] = 0
 
         per_token_logps = torch.gather(
-            logits.log_softmax(-1),
+            local_logits.log_softmax(-1),
             dim=2,
             index=labels_masked.unsqueeze(2),
         ).squeeze(2) * loss_mask.float()
 
-        bsz, seq_len = per_token_logps.shape
-        positions = torch.arange(seq_len, device=per_token_logps.device).unsqueeze(0).expand(bsz, -1)
+        bsz, local_len = per_token_logps.shape
+
+        if parallel_states.sequence_parallel_is_initialized():
+            rank = parallel_states.get_sequence_parallel_rank()
+            # logits length before local shift corresponds to local chunk size
+            seq_len_chunk = logits.size(1)
+            offset = rank * seq_len_chunk
+            positions = torch.arange(
+                offset,
+                offset + local_len,
+                device=per_token_logps.device,
+            ).unsqueeze(0).expand(bsz, -1)
+
+            seg_mask = (
+                (positions > segment_start_indices.unsqueeze(1))
+                & (positions <= segment_end_indices.unsqueeze(1))
+            )
+
+            local_sum = (per_token_logps * seg_mask.float()).sum(dim=1)
+            dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=parallel_states.get_sequence_parallel_group())
+
+            if average_log_prob:
+                local_n = seg_mask.sum(dim=1).float()
+                dist.all_reduce(local_n, op=dist.ReduceOp.SUM, group=parallel_states.get_sequence_parallel_group())
+                return torch.where(local_n > 0, local_sum / local_n, local_sum)
+
+            return local_sum
+
+        positions = torch.arange(local_len, device=per_token_logps.device).unsqueeze(0).expand(bsz, -1)
         seg_mask = (
             (positions > segment_start_indices.unsqueeze(1))
             & (positions <= segment_end_indices.unsqueeze(1))
