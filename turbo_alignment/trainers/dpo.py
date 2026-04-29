@@ -594,8 +594,12 @@ class DPOTrainer(TrainerWithSeqP):
             ):
                 raise ValueError(f'You should normalize logits by length when using {self.loss_type}')
 
-            loss_args = args.loss_settings
-            loss_args.pop('loss_type')  # type: ignore[union-attr]
+            loss_args = (
+                args.loss_settings.model_dump()
+                if hasattr(args.loss_settings, 'model_dump')
+                else dict(args.loss_settings)
+            )
+            loss_args.pop('loss_type', None)
             self.dpo_loss_registry = DPOLossRegistry.by_name(self.loss_type)(**loss_args)
 
         self._stored_metrics: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
@@ -684,7 +688,8 @@ class DPOTrainer(TrainerWithSeqP):
         Follows RM-style behavior: sequence-parallel padding/splitting is handled
         upstream by DataCollatorForSequenceParallism, so trainer does not pad/slice.
         """
-        attn_additive = torch.finfo(model.dtype).min * (attention_mask_4d == 0).to(model.dtype)
+        model_dtype = next(model.parameters()).dtype
+        attn_additive = torch.finfo(model_dtype).min * (attention_mask_4d == 0).to(model_dtype)
         return model(
             input_ids=input_ids,
             attention_mask=attn_additive,

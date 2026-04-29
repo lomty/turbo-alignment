@@ -139,7 +139,7 @@ class PairPreferenceDataCollator(DataCollatorForSeq2Seq):
         batch = super().__call__([{'input_ids': input_ids} for input_ids in concat_input_ids])
         device = batch['input_ids'].device
 
-        batch_size, max_seq_len = batch['input_ids'].shape[:2]
+        _, max_seq_len = batch['input_ids'].shape[:2]
         boundaries_tensor = torch.tensor(boundaries, dtype=torch.long, device=device)  # [batch_size, 3]
 
         batch['attention_mask'] = self._get_attn_mask(boundaries_tensor, max_seq_len, device)

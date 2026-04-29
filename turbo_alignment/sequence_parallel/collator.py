@@ -127,8 +127,8 @@ class DataCollatorForSequenceParallism:
             # 3. Returning ONLY the chunk corresponding to the current GPU rank.
             # This ensures that each GPU processes a unique, non-overlapping segment of the sequence.
             return {key: self.prepare_value(key, value) for key, value in collated.items()}
-        else:
-            return self._split_value(collated)
+
+        return self._split_value(collated)
 
     def should_be_splitted(self, key):
         return key not in self.fields_not_to_split
